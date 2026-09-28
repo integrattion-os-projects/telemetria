@@ -1,0 +1,55 @@
+{
+  "name": "@integrattion/telemetria",
+  "version": "0.1.0",
+  "description": "Telemetria leve de performance percebida (T0-T4 + web-vitals) para os sistemas do ecossistema Integrattion. Núcleo <=3KB gzip, carregado fora do caminho crítico.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/integrattion-os-projects/telemetria.git"
+  },
+  "keywords": [
+    "telemetry",
+    "web-vitals",
+    "performance",
+    "rum",
+    "integrattion"
+  ],
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "npm run build",
+    "size": "npm run build && node scripts/measure-gzip.mjs",
+    "test": "node --test --experimental-strip-types test/*.test.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "web-vitals": "^4.2.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
