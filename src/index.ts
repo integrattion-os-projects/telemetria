@@ -56,6 +56,32 @@ interface TelemetriaState {
 
 let state: TelemetriaState | null = null;
 
+/**
+ * Fila de marcos chamados ANTES de `init()` rodar (INTG-0139 A05 — achado A04:
+ * `mark('action-ready')` chamado antes de `init()` se perdia em silêncio, sem
+ * fila e sem erro, derrubando T3 — o marco central do card). `init()` só roda
+ * depois de `load` + `requestIdleCallback`; qualquer tela que fique pronta
+ * antes disso (comum em SPA com hidratação rápida) chama `mark()` num momento
+ * em que `state` ainda é `null`. O timestamp é capturado AQUI, no instante da
+ * chamada de `mark()` — nunca no instante em que a fila for drenada, porque
+ * `init()` pode rodar segundos depois e o timestamp perderia o sentido.
+ */
+interface PendingMark {
+  name: string;
+  timestamp: number;
+}
+
+let pendingMarks: PendingMark[] = [];
+
+/** Teto defensivo da fila pré-init — se `init()` nunca rodar (app quebrada
+ * antes disso), a fila não cresce sem limite. Bem acima do uso real: `mark()`
+ * pré-init serve pra um punhado de marcos (T2/T3), não pra tráfego normal. */
+const MAX_PENDING_MARKS = 50;
+
+function nowMs(): number {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
 function flushNow(): void {
   if (!state) return;
   state.buffer.flush();
@@ -121,9 +147,21 @@ export function init(config: TelemetriaConfig): void {
     sampledIn,
   };
 
-  if (!sampledIn) return;
+  if (!sampledIn) {
+    pendingMarks = [];
+    return;
+  }
 
   bindLifecycleFlush();
+
+  // Drena a fila de mark() chamados antes de init() — na ordem em que
+  // chegaram, com o timestamp capturado no momento original da chamada.
+  if (pendingMarks.length > 0) {
+    for (const pending of pendingMarks) {
+      state.buffer.push(pending);
+    }
+    pendingMarks = [];
+  }
 
   // T0 — reação ao clique/navegação: primeiro clique após o init.
   if (typeof window !== "undefined") {
@@ -165,7 +203,7 @@ function recordMark(name: string, timestamp?: number): void {
   if (!state || !state.sampledIn) return;
   state.buffer.push({
     name,
-    timestamp: timestamp ?? (typeof performance !== "undefined" ? performance.now() : Date.now()),
+    timestamp: timestamp ?? nowMs(),
   });
 }
 
@@ -176,11 +214,34 @@ function recordMark(name: string, timestamp?: number): void {
  * granularidade maior, pode chamar `mark('context-ready')` antes: isso
  * sobrescreve T2 com um timestamp mais cedo, e o `action-ready` seguinte
  * grava só T3.
+ *
+ * Chamada antes de `init()` (state ainda `null`): em vez de descartar em
+ * silêncio (achado A04), enfileira em `pendingMarks` já com os nomes finais
+ * resolvidos (T2/T3 ou o nome bruto) e o timestamp capturado agora — `init()`
+ * drena a fila na ordem de chegada assim que o estado existir. Não há como
+ * saber aqui se a sessão vai cair em `sampledIn`/amostragem: essa decisão só
+ * existe depois de `init()`, e é lá que a fila é descartada se a sessão não
+ * for amostrada.
  */
 export function mark(name: string): void {
-  if (!state || !state.sampledIn) return;
+  if (!state) {
+    if (pendingMarks.length >= MAX_PENDING_MARKS) return;
+    const ts = nowMs();
+    if (name === "action-ready") {
+      pendingMarks.push({ name: "T2", timestamp: ts }, { name: "T3", timestamp: ts });
+      return;
+    }
+    if (name === "context-ready") {
+      pendingMarks.push({ name: "T2", timestamp: ts });
+      return;
+    }
+    pendingMarks.push({ name, timestamp: ts });
+    return;
+  }
+
+  if (!state.sampledIn) return;
   if (name === "action-ready") {
-    const ts = typeof performance !== "undefined" ? performance.now() : Date.now();
+    const ts = nowMs();
     // grava T2 e T3 no mesmo timestamp (spec A02). Se a app já chamou
     // 'context-ready' antes, este T2 é redundante (dois pontos no mesmo
     // marco não quebram a leitura de p50/p75/p95 no consolidado).
@@ -203,4 +264,15 @@ export function flush(): void {
 /** Só para teste/inspeção — não é API pública estável. */
 export function __getStateForTest(): TelemetriaState | null {
   return state;
+}
+
+/**
+ * Só para teste — não é API pública estável. `state` e `pendingMarks` são
+ * singletons de módulo; sem isso, testes que rodam `init()`/`mark()` em
+ * sequência no mesmo processo (ex.: `node --test`, que não recarrega o
+ * módulo entre arquivos) vazam estado de um teste pro outro.
+ */
+export function __resetForTest(): void {
+  state = null;
+  pendingMarks = [];
 }

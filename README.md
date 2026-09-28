@@ -22,7 +22,7 @@ O **núcleo** (tudo que roda antes de qualquer marco) é medido em
 `npm run size` (gzip nível 9, `node:zlib`):
 
 ```
-Núcleo (dist/index.js) gzip: 1691 bytes (1.65 KB) — OK
+Núcleo (dist/index.js) gzip: 1792 bytes (1.75 KB) — OK
 ```
 
 `web-vitals` **não entra nesse número**: é uma dependência declarada em
@@ -43,6 +43,23 @@ A lib é framework-agnóstica: funciona igual em Next.js e em Vite. A única
 regra dura é **nunca importar estaticamente** — sempre atrás de
 `requestIdleCallback` depois do `load`, via import dinâmico.
 
+### Autenticação — `endpoint` precisa incluir `?key=`
+
+A chave de escrita vai na **query string** do `endpoint`, nunca em header
+customizado — `navigator.sendBeacon` (o transporte principal da lib) não
+permite headers customizados, só o corpo e a URL. Sem `?key=` na URL, todo
+envio recebe `401 Unauthorized` da rota de ingestão.
+
+```
+https://os.integrattion.com.br/api/telemetria/ingest?key=<chave-da-entity>
+```
+
+Essa chave é **por entity** (não é a API key global do OS) e vem do campo
+`Entity.telemetryWriteKey` no banco do Integrattion OS — cada sistema plugado
+usa a própria chave, gerada uma vez pela entity correspondente. Os exemplos
+abaixo já mostram o `endpoint` com o `?key=` incluído; copiar o exemplo sem
+substituir `<chave-da-entity>` pela chave real também resulta em `401`.
+
 ### Next.js (app router)
 
 ```tsx
@@ -56,7 +73,7 @@ export function TelemetriaBoot() {
       import("@integrattion/telemetria").then(({ init }) => {
         init({
           entitySlug: "integrattion-os",
-          endpoint: "https://os.integrattion.com.br/api/telemetria/ingest",
+          endpoint: "https://os.integrattion.com.br/api/telemetria/ingest?key=<chave-da-entity>",
           sampleRate: 0.1,
         });
       });
@@ -79,7 +96,7 @@ function bootTelemetria() {
   import("@integrattion/telemetria").then(({ init }) => {
     init({
       entitySlug: "foccus",
-      endpoint: "https://os.integrattion.com.br/api/telemetria/ingest",
+      endpoint: "https://os.integrattion.com.br/api/telemetria/ingest?key=<chave-da-entity>",
       sampleRate: 0.1,
     });
   });
@@ -99,6 +116,15 @@ import { mark } from "@integrattion/telemetria";
 // depois que os dados da tela chegaram e o usuário já pode agir sobre eles
 mark("action-ready");
 ```
+
+**`mark()` chamado antes de `init()` não se perde.** `init()` só roda depois
+de `load` + `requestIdleCallback`, mas a app pode ficar "pronta pra agir"
+antes disso (comum em SPA com hidratação rápida). Se `mark(...)` for chamado
+nesse intervalo, o timestamp é capturado na hora e o marco é enfileirado
+internamente; assim que `init()` roda, a fila é drenada na ordem em que os
+marcos chegaram, antes dos marcos automáticos do próprio `init()` (T0/T1/T4).
+Não é preciso nenhum código extra na app pra isso funcionar — é o
+comportamento padrão de `mark()`.
 
 ## Marcos medidos
 
@@ -227,8 +253,8 @@ normalizeRoute(pathname: string, options?: NormalizeRouteOptions): string;
 
 ```bash
 npm install
-npm test        # node --test, cobre normalização de rota, buffer/lote, teto, amostragem
-npm run build   # tsup -> dist/ (esm + cjs + types)
+npm run build   # tsup -> dist/ (esm + cjs + types) — rode antes de testar (test/index.test.ts importa de dist/)
+npm test        # node --test, cobre normalização de rota, buffer/lote, teto, amostragem, mark() pré-init
 npm run size    # build + mede o gzip real do núcleo contra a meta de 3 KB
 ```
 
