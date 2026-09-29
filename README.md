@@ -126,15 +126,37 @@ marcos chegaram, antes dos marcos automáticos do próprio `init()` (T0/T1/T4).
 Não é preciso nenhum código extra na app pra isso funcionar — é o
 comportamento padrão de `mark()`.
 
+## Navegação client-side (SPA) — desde 0.2.0
+
+A lib percebe navegação DENTRO do app sozinha: assim que `init()` roda uma
+vez, `pushState`/`replaceState`/`popstate` ficam instrumentados (App Router
+do Next passa por `pushState`, mas a instrumentação é framework-agnóstica —
+funciona em qualquer SPA). **Não é preciso chamar `init()` de novo a cada
+troca de rota** — isso continua funcionando, mas é um reset completo (zera o
+teto de eventos da sessão); pra troca de rota normal, deixe a lib perceber
+sozinha.
+
+A cada troca de rota, a lib fecha o ciclo da tela anterior (envia o que
+estiver pendente com a rota certa) e abre um ciclo novo — T1/T3/T4 da rota
+nova nunca herdam valor da rota anterior nem do boot original. `sessionId` e
+o teto de eventos por sessão continuam os mesmos durante toda a navegação:
+trocar de rota não é uma sessão nova, é a mesma sessão vendo outra tela.
+
+**Achado corrigido na 0.2.0 (INTG-0139 A09):** antes disso, `init()` fixava a
+rota uma única vez no boot; toda tela aberta depois por clique (SPA) gravava
+T1/T3/T4 com o tempo herdado da carga original, inflado — o card inteiro
+dependia dessa correção pra medir o OS (que é SPA) e qualquer sistema
+plugado que não seja boot direto a cada tela.
+
 ## Marcos medidos
 
 | Marco | Significado | Como é obtido |
 |---|---|---|
-| T0 | Reação ao clique/navegação | Automático: timestamp do primeiro `click` capturado após `init()`. |
-| T1 | Estrutura na tela | Automático: `first-contentful-paint` (via `PerformanceObserver`/`getEntriesByType('paint')`), ou o instante do `init()` se a API não existir. |
-| T2 | Contexto carregado | Manual — `mark('context-ready')`, ou implícito junto com T3 se só `mark('action-ready')` for chamado (ver abaixo). |
-| T3 | Pronto pra agir | Manual — `mark('action-ready')`. |
-| T4 | Completo | Automático: `loadEventEnd` da `PerformanceNavigationTiming`, ou o instante do `init()` se a API não existir. |
+| T0 | Reação ao clique que motivou a navegação | Automático, só em navegação client-side: duração real do clique até o próximo quadro pintado (`requestAnimationFrame` duplo). **Não é emitido no boot inicial** — não existe um clique prévio que motivou o carregamento da primeira página. Só é emitido se um clique aconteceu nos últimos 3s antes da troca de rota (senão a navegação não veio de um clique rastreável, ex.: `popstate` por atalho de teclado). |
+| T1 | Estrutura na tela | Boot inicial: `first-contentful-paint` (via `PerformanceObserver`/`getEntriesByType('paint')`). Navegação client-side: duração da troca de rota até o próximo quadro pintado (mesmo duplo `requestAnimationFrame` do T0). |
+| T2 | Contexto carregado | Manual — `mark('context-ready')`, ou implícito junto com T3 se só `mark('action-ready')` for chamado (ver abaixo). Sempre da rota atual. |
+| T3 | Pronto pra agir | Manual — `mark('action-ready')`. Sempre da rota atual — chamar em uma rota nunca aparece na rota anterior nem na seguinte. |
+| T4 | Completo | Boot inicial: `loadEventEnd` da `PerformanceNavigationTiming`. Navegação client-side: duração da troca de rota até o navegador ficar ocioso (`requestIdleCallback`), como aproximação de "terminou de assentar" — SPA não tem um evento `load` por rota. |
 
 **T2 e T3 pela mesma chamada.** Por decisão da spec A02, `mark('action-ready')`
 grava T2 e T3 no mesmo timestamp — é o mínimo que uma app precisa chamar.
@@ -254,7 +276,7 @@ normalizeRoute(pathname: string, options?: NormalizeRouteOptions): string;
 ```bash
 npm install
 npm run build   # tsup -> dist/ (esm + cjs + types) — rode antes de testar (test/index.test.ts importa de dist/)
-npm test        # node --test, cobre normalização de rota, buffer/lote, teto, amostragem, mark() pré-init
+npm test        # node --test, cobre normalização de rota, buffer/lote, teto, amostragem, mark() pré-init, navegação SPA
 npm run size    # build + mede o gzip real do núcleo contra a meta de 3 KB
 ```
 

@@ -78,8 +78,42 @@ let pendingMarks: PendingMark[] = [];
  * pré-init serve pra um punhado de marcos (T2/T3), não pra tráfego normal. */
 const MAX_PENDING_MARKS = 50;
 
+/**
+ * INTG-0139 A09 — achado do C01: a lib fixava a rota em `init()` (chamado uma
+ * vez no boot) e não percebia navegação client-side (SPA/App Router). Toda
+ * tela aberta depois por clique herdava o tempo da carga original, inflado.
+ *
+ * `lastClickTs` é atualizado por um listener PERSISTENTE (nunca removido,
+ * diferente do antigo `onFirstInteraction` de uma vez só) — é o que permite
+ * `handleRouteChange` saber se a navegação atual nasceu de um clique recente
+ * o bastante pra virar T0 real (clique → próximo quadro pintado), sem
+ * depender de a app instrumentar o clique manualmente.
+ */
+let lastClickTs: number | null = null;
+const MAX_CLICK_TO_NAV_GAP_MS = 3000;
+let navHooksInstalled = false;
+
 function nowMs(): number {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+/** Dois `requestAnimationFrame` encadeados: o 1º roda antes do navegador
+ * pintar o frame corrente, o 2º já é depois do paint — técnica padrão pra
+ * medir "tempo até resposta visual" sem depender de PerformanceObserver. */
+function doubleRaf(cb: () => void): void {
+  const raf =
+    typeof requestAnimationFrame === "function"
+      ? requestAnimationFrame
+      : (fn: () => void) => setTimeout(fn, 16);
+  raf(() => raf(cb));
+}
+
+function onIdle(cb: () => void): void {
+  const ric =
+    typeof requestIdleCallback === "function"
+      ? requestIdleCallback
+      : (fn: () => void) => setTimeout(fn, 50);
+  ric(() => cb());
 }
 
 function flushNow(): void {
@@ -112,9 +146,16 @@ function bindLifecycleFlush(): void {
 }
 
 /**
- * Inicializa a telemetria pra uma sessão de página. Idempotente: chamar de
- * novo substitui a config e reseta o estado (útil em navegação client-side
- * de SPA, onde a app deve chamar `init` de novo a cada mudança de rota).
+ * Inicializa a telemetria pra uma sessão de página. Chamar `init()` de novo
+ * é um RESET completo (nova config, novo buffer, zera o teto de eventos da
+ * sessão) — use só pra um boot novo de verdade, nunca pra troca de rota.
+ *
+ * Desde a INTG-0139 A09, a app NÃO precisa mais chamar `init()` a cada
+ * navegação client-side: `installNavigationHooks()` intercepta
+ * `pushState`/`replaceState`/`popstate` e trata a troca de rota sozinha
+ * (`handleRouteChange`), preservando sessionId e o teto de eventos por
+ * sessão. Chamar `init()` de novo continua funcionando, mas reinicia tudo —
+ * é o caminho certo só se a app quiser mesmo começar uma sessão nova.
  */
 export function init(config: TelemetriaConfig): void {
   const sampleRate = config.sampleRate ?? 1;
@@ -153,6 +194,7 @@ export function init(config: TelemetriaConfig): void {
   }
 
   bindLifecycleFlush();
+  installNavigationHooks();
 
   // Drena a fila de mark() chamados antes de init() — na ordem em que
   // chegaram, com o timestamp capturado no momento original da chamada.
@@ -163,40 +205,126 @@ export function init(config: TelemetriaConfig): void {
     pendingMarks = [];
   }
 
-  // T0 — reação ao clique/navegação: primeiro clique após o init.
-  if (typeof window !== "undefined") {
-    const onFirstInteraction = () => {
-      recordMark("T0");
-      window.removeEventListener("click", onFirstInteraction, true);
-    };
-    window.addEventListener("click", onFirstInteraction, true);
-  }
-
-  // T1 — estrutura: DOMContentLoaded já disparou (import dinâmico só roda
-  // depois de load, então isso é sempre verdadeiro) ou o first-contentful-paint.
-  if (typeof performance !== "undefined" && typeof performance.getEntriesByType === "function") {
-    const fcp = performance
-      .getEntriesByType("paint")
-      .find((entry) => entry.name === "first-contentful-paint");
-    recordMark("T1", fcp ? fcp.startTime : undefined);
-  } else {
-    recordMark("T1");
-  }
-
-  // T4 — completo: load já disparou (mesma razão do T1) ou loadEventEnd.
-  if (typeof performance !== "undefined" && typeof performance.getEntriesByType === "function") {
-    const [navEntry] = performance.getEntriesByType(
-      "navigation",
-    ) as PerformanceNavigationTiming[];
-    recordMark("T4", navEntry?.loadEventEnd || undefined);
-  } else {
-    recordMark("T4");
-  }
+  recordInitialMarks();
 
   void observeVitals((partial) => {
     if (!state) return;
     state.vitals = { ...state.vitals, ...partial };
   });
+}
+
+/**
+ * Marcos da CARGA INICIAL (boot), únicos que têm `performance.getEntriesByType`
+ * de verdade pra se apoiar (navigation/paint timing só existem pra navegação
+ * de documento, não pra troca de rota via history API). Navegação client-side
+ * subsequente usa `recordRouteChangeMarks`, que não tem esses dados e mede
+ * via `requestAnimationFrame`/`requestIdleCallback` a partir do instante da
+ * troca de rota.
+ *
+ * T0 (reação ao clique) não é emitido aqui: no boot inicial não existe um
+ * clique prévio que motivou a navegação (achado do C01 — o T0 antigo gravava
+ * só o instante do primeiro clique da sessão, sem relação com carregamento
+ * nenhum, e nenhum campo do manual usava esse valor).
+ */
+function recordInitialMarks(): void {
+  if (typeof performance !== "undefined" && typeof performance.getEntriesByType === "function") {
+    const fcp = performance
+      .getEntriesByType("paint")
+      .find((entry) => entry.name === "first-contentful-paint");
+    recordMark("T1", fcp ? fcp.startTime : undefined);
+
+    const [navEntry] = performance.getEntriesByType(
+      "navigation",
+    ) as PerformanceNavigationTiming[];
+    recordMark("T4", navEntry?.loadEventEnd || undefined);
+  } else {
+    recordMark("T1");
+    recordMark("T4");
+  }
+}
+
+/**
+ * Troca de rota client-side (SPA). `newRoute` já é o valor de retorno de
+ * `normalizeRoute` no instante da chamada — recalculado aqui e não passado
+ * pelo chamador porque `handleRouteChange` é o único ponto de entrada tanto
+ * do wrapper de pushState/replaceState quanto do listener de `popstate`.
+ *
+ * Fecha o ciclo da rota anterior (flush do que estiver pendente) ANTES de
+ * trocar `state.config.route` — é o que garante que os eventos da rota
+ * antiga cheguem no `TelemetriaConsolidadoDiario` com a rota certa, mesmo
+ * que o buffer ainda tivesse itens não drenados. O buffer em si NÃO é
+ * recriado (só flushado): recriar zeraria `totalAccepted` e o teto de
+ * eventos por sessão (spec A02) passaria a valer por rota, não por sessão.
+ */
+function handleRouteChange(): void {
+  if (!state) return;
+
+  const newRoute = normalizeRoute(
+    typeof location !== "undefined" ? location.pathname : "/",
+    { extraStaticSegments: state.config.extraStaticSegments },
+  );
+  if (newRoute === state.config.route) return; // ex.: pushState só de query string
+
+  flushNow();
+
+  const navChangeTs = nowMs();
+  const clickTs = lastClickTs;
+  const clickIsRecent = clickTs != null && navChangeTs - clickTs <= MAX_CLICK_TO_NAV_GAP_MS;
+
+  state.config.route = newRoute;
+
+  if (!state.sampledIn) return;
+
+  doubleRaf(() => {
+    if (!state || state.config.route !== newRoute) return; // outra navegação já aconteceu
+    const paintedTs = nowMs();
+    recordMark("T1", paintedTs - navChangeTs);
+    if (clickIsRecent) {
+      recordMark("T0", paintedTs - (clickTs as number));
+    }
+  });
+
+  onIdle(() => {
+    if (!state || state.config.route !== newRoute) return;
+    recordMark("T4", nowMs() - navChangeTs);
+  });
+}
+
+/**
+ * Instrumenta `history.pushState`/`replaceState` (o App Router do Next e
+ * praticamente toda SPA passam por eles, com ou sem `popstate` — o navegador
+ * não dispara `popstate` sozinho pra navegação programática) + `popstate`
+ * (botão voltar/avançar) + um listener de clique PERSISTENTE pra alimentar
+ * `lastClickTs`. Idempotente: chamado a cada `init()`, mas só instala uma vez
+ * por `globalThis` — `__resetForTest` zera a flag pra testes que trocam o
+ * `window`/`history` global a cada rodada.
+ */
+function installNavigationHooks(): void {
+  if (navHooksInstalled) return;
+  if (typeof window === "undefined" || typeof history === "undefined") return;
+  navHooksInstalled = true;
+
+  window.addEventListener(
+    "click",
+    () => {
+      lastClickTs = nowMs();
+    },
+    { capture: true, passive: true },
+  );
+
+  (["pushState", "replaceState"] as const).forEach((method) => {
+    const original = history[method];
+    history[method] = function (
+      this: History,
+      ...args: Parameters<History[typeof method]>
+    ): ReturnType<History[typeof method]> {
+      const result = original.apply(this, args);
+      handleRouteChange();
+      return result;
+    } as History[typeof method];
+  });
+
+  window.addEventListener("popstate", () => handleRouteChange());
 }
 
 function recordMark(name: string, timestamp?: number): void {
@@ -275,4 +403,15 @@ export function __getStateForTest(): TelemetriaState | null {
 export function __resetForTest(): void {
   state = null;
   pendingMarks = [];
+  lastClickTs = null;
+  // `navHooksInstalled` zera pra permitir reinstalar contra um novo shim de
+  // window/history a cada teste (INTG-0139 A09) — sem isso, o segundo teste
+  // que troca o globalThis.window herdaria o wrapper preso ao objeto antigo.
+  navHooksInstalled = false;
+}
+
+/** Só para teste — expõe se o clique disparou uma navegação recente o
+ * bastante pra virar T0 real. Não é API pública estável. */
+export function __simulateClickForTest(): void {
+  lastClickTs = nowMs();
 }
