@@ -98,6 +98,13 @@ interface CapturedCall {
   body: string;
 }
 
+/**
+ * Aceita `run` síncrono ou assíncrono. Se `run` devolver uma Promise, o
+ * `fetch` fake só é restaurado depois dela resolver — sem isso, um teste
+ * `async` que espera de verdade (ex.: simular permanência numa tela antes de
+ * navegar) teria o `fetch` original restaurado cedo demais, no meio do await,
+ * e o `flush()` chamado depois da espera perderia o fetch fake.
+ */
 function withFakeFetch<T>(run: (calls: CapturedCall[]) => T): T {
   const calls: CapturedCall[] = [];
   const originalFetch = (globalThis as { fetch?: typeof fetch }).fetch;
@@ -105,11 +112,34 @@ function withFakeFetch<T>(run: (calls: CapturedCall[]) => T): T {
     calls.push({ url, body: String(init?.body ?? "") });
     return Promise.resolve(new Response(null, { status: 204 }));
   }) as typeof fetch;
-  try {
-    return run(calls);
-  } finally {
+
+  const restore = () => {
     (globalThis as { fetch?: typeof fetch }).fetch = originalFetch;
+  };
+
+  let result: T;
+  try {
+    result = run(calls);
+  } catch (error) {
+    restore();
+    throw error;
   }
+
+  if (result instanceof Promise) {
+    return result.then(
+      (value) => {
+        restore();
+        return value;
+      },
+      (error) => {
+        restore();
+        throw error;
+      },
+    ) as T;
+  }
+
+  restore();
+  return result;
 }
 
 function payloadsFromCalls(calls: CapturedCall[]): Array<{ route: string; marks: Array<{ name: string; timestamp: number }> }> {
@@ -148,6 +178,48 @@ test("duas navegações seguidas (pushState) geram dois conjuntos de marcos, cad
     assert.ok(
       !rotaInicial!.marks.some((m) => m.name === "T3"),
       "T3 da rota nova não pode vazar pro payload da rota inicial",
+    );
+  });
+});
+
+test("T3 (mark) não cresce com o tempo parado na tela anterior — regressão do achado A10", async () => {
+  // A10 encontrou T3 absoluto (nowMs() desde o início do documento) mesmo
+  // depois do A09 corrigir T0/T1/T4: o valor gravado crescia junto com a
+  // PERMANÊNCIA na tela anterior, em vez de refletir o tempo real da rota
+  // nova. O teste antigo só conferia `nomes.includes("T3")`, nunca o valor —
+  // por isso não pegou. Este replica o cenário: espera de verdade ANTES de
+  // navegar, e confirma que o T3 da rota nova continua pequeno.
+  telemetria.__resetForTest();
+  const shim = installFreshBrowserShim("/inicio");
+
+  await withFakeFetch(async (calls) => {
+    telemetria.init({
+      entitySlug: "teste-a11-regressao-t3",
+      endpoint: "http://localhost/telemetria-teste",
+      sampleRate: 1,
+      batchSize: 1000,
+    });
+    telemetria.flush();
+
+    // Permanência real na tela anterior — é justamente o que inflava o T3
+    // antigo. 300ms é bem acima do teto que o teste checa abaixo (50ms).
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    setPathname("/pagina-depois-de-espera");
+    (g.history as { pushState: () => void }).pushState();
+    shim.fireRaf();
+    shim.fireIdle();
+    telemetria.mark("action-ready"); // T3 da rota nova, gravado logo após navegar
+    telemetria.flush();
+
+    const rotaNova = payloadsFromCalls(calls).find((p) => p.route === "/pagina-depois-de-espera");
+    assert.ok(rotaNova, "precisa existir payload da rota nova");
+    const t3 = rotaNova!.marks.find((m) => m.name === "T3");
+    assert.ok(t3, "T3 precisa existir");
+    assert.ok(
+      t3!.timestamp < 50,
+      `T3 deveria ser pequeno (mark() chamado logo após navegar), mas veio ${t3!.timestamp}ms — ` +
+        `sinal de que herdou os 300ms de permanência na tela anterior (regressão do achado A10)`,
     );
   });
 });

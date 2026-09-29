@@ -52,6 +52,25 @@ interface TelemetriaState {
   buffer: EventBuffer;
   vitals: VitalsSnapshot;
   sampledIn: boolean;
+  /**
+   * INTG-0139 A11 — achado do A10: `mark()` continuava gravando T2/T3 com
+   * `nowMs()` absoluto (tempo desde o início do DOCUMENTO), mesmo depois da
+   * A09 ter corrigido T0/T1/T4 para relativos à troca de rota. Efeito medido
+   * em produção simulada: T3 crescia junto com o tempo parado na tela
+   * ANTERIOR, em vez de refletir o tempo real da rota nova.
+   *
+   * `routeStartTs` é o instante (na mesma escala de `nowMs()`) em que o ciclo
+   * de marcos ATUAL começou: `0` no boot (porque `performance.now()`/FCP/
+   * `loadEventEnd` já são nativamente relativos ao início da navegação —
+   * subtrair 0 não muda nada, preserva o comportamento de sempre) e
+   * `navChangeTs` a cada `handleRouteChange`. Todo marco que passa por
+   * `recordMark` — automáticos (T1/T4) E manuais (T2/T3 via `mark()`) — sai
+   * relativo a este valor. T0 é a ÚNICA exceção: mede exatamente
+   * clique→paint, não faz sentido relativizar por `routeStartTs` (que é o
+   * instante da troca de rota, não o do clique) — por isso usa
+   * `recordDuration`, que grava a duração já calculada sem subtrair nada.
+   */
+  routeStartTs: number;
 }
 
 let state: TelemetriaState | null = null;
@@ -186,6 +205,9 @@ export function init(config: TelemetriaConfig): void {
     }),
     vitals: {},
     sampledIn,
+    // 0 no boot: performance.now()/FCP/loadEventEnd já são nativamente
+    // relativos ao início da navegação, subtrair 0 preserva o valor.
+    routeStartTs: 0,
   };
 
   if (!sampledIn) {
@@ -272,21 +294,26 @@ function handleRouteChange(): void {
   const clickIsRecent = clickTs != null && navChangeTs - clickTs <= MAX_CLICK_TO_NAV_GAP_MS;
 
   state.config.route = newRoute;
+  // A11: todo marco recordMark() gravado a partir daqui — automático (T1/T4)
+  // OU manual (T2/T3 via mark(), achado real do A10) — passa a ser relativo
+  // a este instante, não mais ao início absoluto do documento.
+  state.routeStartTs = navChangeTs;
 
   if (!state.sampledIn) return;
 
   doubleRaf(() => {
     if (!state || state.config.route !== newRoute) return; // outra navegação já aconteceu
-    const paintedTs = nowMs();
-    recordMark("T1", paintedTs - navChangeTs);
+    recordMark("T1"); // nowMs() (default) - routeStartTs = duração até este paint
     if (clickIsRecent) {
-      recordMark("T0", paintedTs - (clickTs as number));
+      // T0 mede clique->paint exato, não relativo a routeStartTs (que é o
+      // instante da troca de rota, não o do clique) — por isso recordDuration.
+      recordDuration("T0", nowMs() - (clickTs as number));
     }
   });
 
   onIdle(() => {
     if (!state || state.config.route !== newRoute) return;
-    recordMark("T4", nowMs() - navChangeTs);
+    recordMark("T4"); // idem: nowMs() (default) - routeStartTs
   });
 }
 
@@ -327,12 +354,30 @@ function installNavigationHooks(): void {
   window.addEventListener("popstate", () => handleRouteChange());
 }
 
+/**
+ * Grava um marco relativo a `state.routeStartTs` (INTG-0139 A11). `timestamp`,
+ * quando passado, é um instante ABSOLUTO na mesma escala de `nowMs()` (ex.:
+ * `fcp.startTime`) — nunca uma duração já calculada, essa vai por
+ * `recordDuration`. No boot, `routeStartTs` é 0 e o valor sai inalterado
+ * (mesmo comportamento de sempre); após uma troca de rota, `routeStartTs` é
+ * o instante da troca, e o valor gravado passa a ser a duração real desde
+ * então — é a correção do achado do A10 (T2/T3 via `mark()` continuavam
+ * absolutos mesmo depois do A09 corrigir T0/T1/T4).
+ */
 function recordMark(name: string, timestamp?: number): void {
   if (!state || !state.sampledIn) return;
+  const absolute = timestamp ?? nowMs();
   state.buffer.push({
     name,
-    timestamp: timestamp ?? nowMs(),
+    timestamp: absolute - state.routeStartTs,
   });
+}
+
+/** Grava uma DURAÇÃO já calculada, sem subtrair `routeStartTs` — usado só
+ * pelo T0 (clique→paint), que não é relativo ao início do ciclo da rota. */
+function recordDuration(name: string, durationMs: number): void {
+  if (!state || !state.sampledIn) return;
+  state.buffer.push({ name, timestamp: durationMs });
 }
 
 /**

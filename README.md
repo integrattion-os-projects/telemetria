@@ -137,10 +137,21 @@ teto de eventos da sessão); pra troca de rota normal, deixe a lib perceber
 sozinha.
 
 A cada troca de rota, a lib fecha o ciclo da tela anterior (envia o que
-estiver pendente com a rota certa) e abre um ciclo novo — T1/T3/T4 da rota
-nova nunca herdam valor da rota anterior nem do boot original. `sessionId` e
-o teto de eventos por sessão continuam os mesmos durante toda a navegação:
-trocar de rota não é uma sessão nova, é a mesma sessão vendo outra tela.
+estiver pendente com a rota certa) e abre um ciclo novo — T0/T1/T2/T3/T4 da
+rota nova nunca herdam valor da rota anterior nem do boot original.
+`sessionId` e o teto de eventos por sessão continuam os mesmos durante toda a
+navegação: trocar de rota não é uma sessão nova, é a mesma sessão vendo
+outra tela.
+
+**Achado corrigido na 0.2.1:** a 0.2.0 corrigiu T0/T1/T4, mas `mark()`
+(T2/T3) continuava gravando um instante absoluto desde o início do
+DOCUMENTO — em produção simulada, o T3 de uma tela aberta por clique crescia
+junto com o tempo que o usuário ficava parado na tela ANTERIOR, em vez de
+refletir o tempo real da rota nova. Achado do verificador comparando o
+tempo real clique→pronto contra o valor gravado, com permanências
+diferentes na tela anterior. Corrigido com `routeStartTs`: todo marco
+passa a ser relativo ao início do ciclo da rota atual, não ao início do
+documento.
 
 **Achado corrigido na 0.2.0 (INTG-0139 A09):** antes disso, `init()` fixava a
 rota uma única vez no boot; toda tela aberta depois por clique (SPA) gravava
