@@ -36,6 +36,7 @@ function installFreshBrowserShim(pathname: string): {
   fireClick: () => void;
   fireRaf: () => void;
   fireIdle: () => void;
+  firePopstate: () => void;
 } {
   const listeners: Record<string, Listener[]> = { click: [], popstate: [] };
   const fakeWindow = {
@@ -84,6 +85,7 @@ function installFreshBrowserShim(pathname: string): {
       idleQueue = [];
       pending.forEach((cb) => cb());
     },
+    firePopstate: () => listeners.popstate.forEach((cb) => cb()),
   };
 }
 
@@ -262,6 +264,50 @@ test("T3 inclui a espera de rede entre o clique e o pushState (SSR/App Router) �
       t3!.timestamp >= 200,
       `T3 deveria incluir os ~200ms de espera entre o clique e o pushState, mas veio ${t3!.timestamp}ms — ` +
         `sinal de que a referência ainda é o pushState, não o clique (regressão do achado A12)`,
+    );
+  });
+});
+
+test("clique que não navega não contamina uma navegação não relacionada depois (popstate) — regressão do achado A14", async () => {
+  // A14 encontrou: um clique que NÃO leva a navegação nenhuma (ex.: clicar
+  // num <h1>) ficava pendente sem teto, e era consumido pela PRÓXIMA
+  // navegação de qualquer tipo — inclusive popstate do botão voltar, minutos
+  // depois, sem relação nenhuma com aquele clique. Reintroduzia o defeito do
+  // A10 por outro caminho, e ainda inventava um T0 que nunca aconteceu.
+  telemetria.__resetForTest();
+  const shim = installFreshBrowserShim("/inicio");
+
+  await withFakeFetch(async (calls) => {
+    telemetria.init({
+      entitySlug: "teste-a15-clique-orfao",
+      endpoint: "http://localhost/telemetria-teste",
+      sampleRate: 1,
+      batchSize: 1000,
+    });
+    telemetria.flush();
+
+    shim.fireClick(); // clique que NÃO leva a pushState/replaceState nenhum
+    await new Promise((resolve) => setTimeout(resolve, 300)); // usuário lê a tela
+
+    setPathname("/pagina-depois-de-voltar");
+    shim.firePopstate(); // botão voltar — não tem relação com o clique acima
+    shim.fireRaf();
+    shim.fireIdle();
+    telemetria.mark("action-ready");
+    telemetria.flush();
+
+    const rotaNova = payloadsFromCalls(calls).find((p) => p.route === "/pagina-depois-de-voltar");
+    assert.ok(rotaNova, "precisa existir payload da rota nova");
+
+    const t0 = rotaNova!.marks.find((m) => m.name === "T0");
+    assert.ok(!t0, `T0 não deveria existir (popstate não tem clique associado), mas veio ${t0?.timestamp}ms`);
+
+    const t3 = rotaNova!.marks.find((m) => m.name === "T3");
+    assert.ok(t3, "T3 precisa existir");
+    assert.ok(
+      t3!.timestamp < 50,
+      `T3 deveria ser pequeno (mark() chamado logo após o popstate), mas veio ${t3!.timestamp}ms — ` +
+        `sinal de que o clique órfão contaminou esta navegação (regressão do achado A14)`,
     );
   });
 });

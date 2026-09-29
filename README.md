@@ -143,15 +143,24 @@ rota nova nunca herdam valor da rota anterior nem do boot original.
 navegação: trocar de rota não é uma sessão nova, é a mesma sessão vendo
 outra tela.
 
+**Achado corrigido na 0.2.3:** a 0.2.2 removeu o teto de tempo pra um clique
+virar `routeStartTs`, mas isso abriu outro furo — um clique que NÃO leva a
+navegação nenhuma (ex.: clicar num título) ficava pendente pra sempre e era
+consumido pela PRÓXIMA navegação de qualquer tipo, minutos depois, sem
+relação nenhuma com aquele clique (inclusive inventando um T0 que nunca
+aconteceu). Corrigido com dois reforços: **`popstate` nunca consome clique
+pendente** (botão voltar/avançar não é causado por um clique na página
+atual — só `pushState`/`replaceState` podem consumir), e um **teto de
+segurança de 30s** pro consumo via `pushState`/`replaceState` (bem acima de
+qualquer espera de RSC realista, só pra um clique não ficar pendente pra
+sempre se a app nunca navegar de verdade depois dele).
+
 **Achado corrigido na 0.2.2:** em apps com SSR (App Router do Next), o
 `pushState` só acontece DEPOIS do servidor responder (RSC) — usar esse
 instante como referência (`routeStartTs`) deixava T1/T3/T4 cegos pra espera
 de rede: com 3,6s reais de atraso no servidor, o T3 gravado continuava
-~0,6s. Corrigido usando o CLIQUE como referência quando ele existe (sem teto
-de tempo — cada clique é consumido por no máximo uma navegação), caindo de
-volta pro `pushState` só quando não há clique rastreável (ex.: `popstate`
-por atalho de teclado). T0 também deixou de "sumir" em navegações lentas: o
-teto antigo de 3s (que fazia o clique "expirar") foi removido.
+~0,6s. Corrigido usando o CLIQUE como referência quando ele existe, caindo
+de volta pro `pushState` só quando não há clique rastreável.
 
 **Achado corrigido na 0.2.1:** a 0.2.0 corrigiu T0/T1/T4, mas `mark()`
 (T2/T3) continuava gravando um instante absoluto desde o início do

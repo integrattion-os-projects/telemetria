@@ -123,6 +123,25 @@ let lastClickTs: number | null = null;
 let lastClickConsumed = true;
 let navHooksInstalled = false;
 
+/**
+ * INTG-0139 A15 — achado do A14: um clique que NÃO navega (ex.: clicar num
+ * `<h1>`) ficava pendente sem teto e era consumido por uma navegação
+ * totalmente não relacionada depois (ex.: `popstate` do botão voltar,
+ * minutos depois) — reintroduzia o defeito do A10 por outro caminho, e
+ * ainda inventava um T0 que nunca aconteceu. Dois reforços, não um só:
+ *
+ * 1. `popstate` NUNCA consome clique pendente — botão voltar/avançar,
+ *    atalho de teclado ou `history.back()` programático não são causados
+ *    por um clique na página atual, então não faz sentido atribuir um a
+ *    ele. Só `pushState`/`replaceState` (que é como Link/router.push
+ *    disparam navegação de verdade) podem consumir.
+ * 2. Teto de segurança generoso pro consumo via pushState/replaceState —
+ *    bem acima de qualquer espera de RSC realista (a A13 testou até 5s),
+ *    mas finito, pra um clique não ficar pendente pra sempre se a app
+ *    nunca navegar de verdade depois dele.
+ */
+const MAX_CLICK_STALENESS_MS = 30_000;
+
 function nowMs(): number {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
 }
@@ -288,8 +307,12 @@ function recordInitialMarks(): void {
  * que o buffer ainda tivesse itens não drenados. O buffer em si NÃO é
  * recriado (só flushado): recriar zeraria `totalAccepted` e o teto de
  * eventos por sessão (spec A02) passaria a valer por rota, não por sessão.
+ *
+ * `allowClickConsumption` (A15): só `true` quando chamado a partir do
+ * wrapper de `pushState`/`replaceState` — `popstate` nunca consome clique
+ * pendente (ver comentário de `MAX_CLICK_STALENESS_MS`).
  */
-function handleRouteChange(): void {
+function handleRouteChange(allowClickConsumption: boolean): void {
   if (!state) return;
 
   const newRoute = normalizeRoute(
@@ -303,13 +326,21 @@ function handleRouteChange(): void {
   const navChangeTs = nowMs();
 
   // A13: usa o clique como referência (routeStartTs) quando ele ainda não
-  // foi consumido por outra navegação — sem teto de tempo. Em SSR (App
-  // Router), navChangeTs (pushState) só acontece DEPOIS do servidor
-  // responder; usar o clique aqui é o que faz T1/T3/T4 incluírem a espera
-  // de rede, em vez de medir só o trabalho no cliente depois que ela já
-  // passou (achado real do A12: T3 ficava constante mesmo com 3,6s de
-  // atraso real no servidor).
-  const usedClickTs = !lastClickConsumed && lastClickTs != null ? lastClickTs : null;
+  // foi consumido por outra navegação. Em SSR (App Router), navChangeTs
+  // (pushState) só acontece DEPOIS do servidor responder; usar o clique
+  // aqui é o que faz T1/T3/T4 incluírem a espera de rede, em vez de medir
+  // só o trabalho no cliente depois que ela já passou (achado real do A12:
+  // T3 ficava constante mesmo com 3,6s de atraso real no servidor).
+  //
+  // A15: só é elegível se (a) esta navegação pode consumir clique
+  // (pushState/replaceState, nunca popstate) e (b) o clique não está mais
+  // velho que MAX_CLICK_STALENESS_MS — sem isso, um clique que não navegou
+  // (ex.: clicar num `<h1>`) ficava pendente pra sempre e contaminava a
+  // PRÓXIMA navegação de qualquer tipo, minutos depois (achado real do A14).
+  const clickIsFresh =
+    lastClickTs != null && navChangeTs - lastClickTs <= MAX_CLICK_STALENESS_MS;
+  const usedClickTs =
+    allowClickConsumption && !lastClickConsumed && clickIsFresh ? lastClickTs : null;
   if (usedClickTs != null) lastClickConsumed = true;
 
   state.config.route = newRoute;
@@ -369,12 +400,15 @@ function installNavigationHooks(): void {
       ...args: Parameters<History[typeof method]>
     ): ReturnType<History[typeof method]> {
       const result = original.apply(this, args);
-      handleRouteChange();
+      handleRouteChange(true); // pushState/replaceState: pode consumir clique pendente
       return result;
     } as History[typeof method];
   });
 
-  window.addEventListener("popstate", () => handleRouteChange());
+  // popstate NUNCA consome clique pendente (A15) — botão voltar/avançar,
+  // atalho de teclado ou history.back() programático não são causados por
+  // um clique na página atual.
+  window.addEventListener("popstate", () => handleRouteChange(false));
 }
 
 /**

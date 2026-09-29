@@ -1,6 +1,6 @@
 {
   "name": "@integrattion/telemetria",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Telemetria leve de performance percebida (T0-T4 + web-vitals) para os sistemas do ecossistema Integrattion. Núcleo <=3KB gzip, carregado fora do caminho crítico.",
   "type": "module",
   "license": "MIT",
