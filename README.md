@@ -143,6 +143,16 @@ rota nova nunca herdam valor da rota anterior nem do boot original.
 navegação: trocar de rota não é uma sessão nova, é a mesma sessão vendo
 outra tela.
 
+**Achado corrigido na 0.2.2:** em apps com SSR (App Router do Next), o
+`pushState` só acontece DEPOIS do servidor responder (RSC) — usar esse
+instante como referência (`routeStartTs`) deixava T1/T3/T4 cegos pra espera
+de rede: com 3,6s reais de atraso no servidor, o T3 gravado continuava
+~0,6s. Corrigido usando o CLIQUE como referência quando ele existe (sem teto
+de tempo — cada clique é consumido por no máximo uma navegação), caindo de
+volta pro `pushState` só quando não há clique rastreável (ex.: `popstate`
+por atalho de teclado). T0 também deixou de "sumir" em navegações lentas: o
+teto antigo de 3s (que fazia o clique "expirar") foi removido.
+
 **Achado corrigido na 0.2.1:** a 0.2.0 corrigiu T0/T1/T4, mas `mark()`
 (T2/T3) continuava gravando um instante absoluto desde o início do
 DOCUMENTO — em produção simulada, o T3 de uma tela aberta por clique crescia

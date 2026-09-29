@@ -104,12 +104,23 @@ const MAX_PENDING_MARKS = 50;
  *
  * `lastClickTs` é atualizado por um listener PERSISTENTE (nunca removido,
  * diferente do antigo `onFirstInteraction` de uma vez só) — é o que permite
- * `handleRouteChange` saber se a navegação atual nasceu de um clique recente
- * o bastante pra virar T0 real (clique → próximo quadro pintado), sem
+ * `handleRouteChange` saber se a navegação atual nasceu de um clique, sem
  * depender de a app instrumentar o clique manualmente.
+ *
+ * INTG-0139 A13 — achado do A12: usar `navChangeTs` (instante do `pushState`)
+ * como referência pra T1/T3/T4 deixa a medição cega à espera de servidor em
+ * apps com SSR (App Router do Next só chama `pushState` DEPOIS do RSC
+ * responder) — o card inteiro existe pra medir isso, então "otimista demais"
+ * é o pior tipo de erro aqui. `lastClickConsumed` resolve isso: em vez de um
+ * teto de tempo (`MAX_CLICK_TO_NAV_GAP_MS`, removido — ele fazia o clique
+ * "expirar" e T0 sumir justo nas navegações mais lentas, o caso que mais
+ * importa medir), cada clique é usado como `routeStartTs` de NO MÁXIMO uma
+ * navegação — não importa quanto tempo essa navegação demorar. Só cai de
+ * volta pro instante do `pushState` quando não há clique rastreável (ex.:
+ * `popstate` por atalho de teclado, navegação programática sem clique).
  */
 let lastClickTs: number | null = null;
-const MAX_CLICK_TO_NAV_GAP_MS = 3000;
+let lastClickConsumed = true;
 let navHooksInstalled = false;
 
 function nowMs(): number {
@@ -290,25 +301,36 @@ function handleRouteChange(): void {
   flushNow();
 
   const navChangeTs = nowMs();
-  const clickTs = lastClickTs;
-  const clickIsRecent = clickTs != null && navChangeTs - clickTs <= MAX_CLICK_TO_NAV_GAP_MS;
+
+  // A13: usa o clique como referência (routeStartTs) quando ele ainda não
+  // foi consumido por outra navegação — sem teto de tempo. Em SSR (App
+  // Router), navChangeTs (pushState) só acontece DEPOIS do servidor
+  // responder; usar o clique aqui é o que faz T1/T3/T4 incluírem a espera
+  // de rede, em vez de medir só o trabalho no cliente depois que ela já
+  // passou (achado real do A12: T3 ficava constante mesmo com 3,6s de
+  // atraso real no servidor).
+  const usedClickTs = !lastClickConsumed && lastClickTs != null ? lastClickTs : null;
+  if (usedClickTs != null) lastClickConsumed = true;
 
   state.config.route = newRoute;
   // A11: todo marco recordMark() gravado a partir daqui — automático (T1/T4)
   // OU manual (T2/T3 via mark(), achado real do A10) — passa a ser relativo
-  // a este instante, não mais ao início absoluto do documento.
-  state.routeStartTs = navChangeTs;
+  // a este instante, não mais ao início absoluto do documento. A13: essa
+  // referência agora é o clique (quando existe), não mais o pushState.
+  state.routeStartTs = usedClickTs ?? navChangeTs;
 
   if (!state.sampledIn) return;
 
   doubleRaf(() => {
     if (!state || state.config.route !== newRoute) return; // outra navegação já aconteceu
-    recordMark("T1"); // nowMs() (default) - routeStartTs = duração até este paint
-    if (clickIsRecent) {
-      // T0 mede clique->paint exato, não relativo a routeStartTs (que é o
-      // instante da troca de rota, não o do clique) — por isso recordDuration.
-      recordDuration("T0", nowMs() - (clickTs as number));
+    // T0 mede clique->próximo quadro pintado — só existe quando há clique
+    // rastreável. Sem clique (ex.: popstate por atalho de teclado), não há
+    // T0 (nunca inventa um valor), mas T1/T3/T4 continuam medidos a partir
+    // do pushState (usedClickTs == null → routeStartTs == navChangeTs).
+    if (usedClickTs != null) {
+      recordDuration("T0", nowMs() - usedClickTs);
     }
+    recordMark("T1"); // nowMs() (default) - routeStartTs = duração até este paint
   });
 
   onIdle(() => {
@@ -335,6 +357,7 @@ function installNavigationHooks(): void {
     "click",
     () => {
       lastClickTs = nowMs();
+      lastClickConsumed = false; // A13: disponível pra ser usado como routeStartTs da próxima navegação
     },
     { capture: true, passive: true },
   );
@@ -449,14 +472,16 @@ export function __resetForTest(): void {
   state = null;
   pendingMarks = [];
   lastClickTs = null;
+  lastClickConsumed = true;
   // `navHooksInstalled` zera pra permitir reinstalar contra um novo shim de
   // window/history a cada teste (INTG-0139 A09) — sem isso, o segundo teste
   // que troca o globalThis.window herdaria o wrapper preso ao objeto antigo.
   navHooksInstalled = false;
 }
 
-/** Só para teste — expõe se o clique disparou uma navegação recente o
- * bastante pra virar T0 real. Não é API pública estável. */
+/** Só para teste — simula um clique disponível pra virar routeStartTs/T0 da
+ * próxima navegação. Não é API pública estável. */
 export function __simulateClickForTest(): void {
   lastClickTs = nowMs();
+  lastClickConsumed = false;
 }

@@ -224,6 +224,48 @@ test("T3 (mark) não cresce com o tempo parado na tela anterior — regressão d
   });
 });
 
+test("T3 inclui a espera de rede entre o clique e o pushState (SSR/App Router) — regressão do achado A12", async () => {
+  // A12 encontrou que routeStartTs usava o instante do pushState — em apps
+  // com SSR (App Router do Next), pushState só acontece DEPOIS do servidor
+  // responder, então T1/T3/T4 não incluíam a espera de rede: com 3,6s reais
+  // de atraso no servidor, o T3 gravado continuava ~0,6s (o clique já tinha
+  // acontecido havia tempo). Este teste simula exatamente essa topologia:
+  // clique -> espera real (proxy da ida ao servidor) -> só ENTÃO pushState.
+  telemetria.__resetForTest();
+  const shim = installFreshBrowserShim("/inicio");
+
+  await withFakeFetch(async (calls) => {
+    telemetria.init({
+      entitySlug: "teste-a13-regressao-rsc",
+      endpoint: "http://localhost/telemetria-teste",
+      sampleRate: 1,
+      batchSize: 1000,
+    });
+    telemetria.flush();
+
+    shim.fireClick(); // usuário clica — o "servidor" começa a responder agora
+    await new Promise((resolve) => setTimeout(resolve, 200)); // proxy da espera de RSC
+    setPathname("/pagina-lenta");
+    (g.history as { pushState: () => void }).pushState(); // só agora o router troca a rota
+    shim.fireRaf();
+    shim.fireIdle();
+    telemetria.mark("action-ready");
+    telemetria.flush();
+
+    const rotaLenta = payloadsFromCalls(calls).find((p) => p.route === "/pagina-lenta");
+    assert.ok(rotaLenta, "precisa existir payload da rota lenta");
+    const t3 = rotaLenta!.marks.find((m) => m.name === "T3");
+    const t0 = rotaLenta!.marks.find((m) => m.name === "T0");
+    assert.ok(t3, "T3 precisa existir");
+    assert.ok(t0, "T0 precisa existir (havia um clique rastreável antes do pushState)");
+    assert.ok(
+      t3!.timestamp >= 200,
+      `T3 deveria incluir os ~200ms de espera entre o clique e o pushState, mas veio ${t3!.timestamp}ms — ` +
+        `sinal de que a referência ainda é o pushState, não o clique (regressão do achado A12)`,
+    );
+  });
+});
+
 test("T0 da navegação é medido do clique ao próximo quadro pintado, não herdado da carga inicial", () => {
   telemetria.__resetForTest();
   const shim = installFreshBrowserShim("/inicio");
