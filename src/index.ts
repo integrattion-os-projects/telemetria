@@ -53,24 +53,28 @@ interface TelemetriaState {
   vitals: VitalsSnapshot;
   sampledIn: boolean;
   /**
-   * INTG-0139 A11 — achado do A10: `mark()` continuava gravando T2/T3 com
-   * `nowMs()` absoluto (tempo desde o início do DOCUMENTO), mesmo depois da
-   * A09 ter corrigido T0/T1/T4 para relativos à troca de rota. Efeito medido
-   * em produção simulada: T3 crescia junto com o tempo parado na tela
-   * ANTERIOR, em vez de refletir o tempo real da rota nova.
-   *
    * `routeStartTs` é o instante (na mesma escala de `nowMs()`) em que o ciclo
    * de marcos ATUAL começou: `0` no boot (porque `performance.now()`/FCP/
    * `loadEventEnd` já são nativamente relativos ao início da navegação —
-   * subtrair 0 não muda nada, preserva o comportamento de sempre) e
-   * `navChangeTs` a cada `handleRouteChange`. Todo marco que passa por
-   * `recordMark` — automáticos (T1/T4) E manuais (T2/T3 via `mark()`) — sai
-   * relativo a este valor. T0 é a ÚNICA exceção: mede exatamente
-   * clique→paint, não faz sentido relativizar por `routeStartTs` (que é o
-   * instante da troca de rota, não o do clique) — por isso usa
-   * `recordDuration`, que grava a duração já calculada sem subtrair nada.
+   * subtrair 0 não muda nada) e o instante do próprio evento de navegação
+   * (`pushState`/`replaceState`/`popstate`) a cada `handleRouteChange` —
+   * SEMPRE, sem depender de clique (ver nota de desenho em `handleRouteChange`
+   * sobre por que a versão anterior, baseada em clique, foi abandonada).
+   * Todo marco que passa por `recordMark` — automáticos (T1/T4) E manuais
+   * (T2/T3 via `mark()`) — sai relativo a este valor.
    */
   routeStartTs: number;
+  /**
+   * INTG-0139 A17 — achado do A16 (F4): comparar a rota NORMALIZADA pra
+   * decidir se houve troca de rota fazia duas telas do MESMO MOLDE (ex.:
+   * `/card/1` → `/card/2`, ambas `/card/[id]`) nunca abrirem ciclo novo — o
+   * defeito do A10 de volta, só que entre telas do mesmo molde (existe de
+   * verdade no OS: card a card, projeto a projeto). `rawPath` é o
+   * `location.pathname` CRU, usado só pra detectar SE uma navegação
+   * aconteceu; a rota normalizada (`config.route`) continua servindo só pra
+   * rotular/agregar no consolidado.
+   */
+  rawPath: string;
 }
 
 let state: TelemetriaState | null = null;
@@ -97,50 +101,30 @@ let pendingMarks: PendingMark[] = [];
  * pré-init serve pra um punhado de marcos (T2/T3), não pra tráfego normal. */
 const MAX_PENDING_MARKS = 50;
 
-/**
- * INTG-0139 A09 — achado do C01: a lib fixava a rota em `init()` (chamado uma
- * vez no boot) e não percebia navegação client-side (SPA/App Router). Toda
- * tela aberta depois por clique herdava o tempo da carga original, inflado.
- *
- * `lastClickTs` é atualizado por um listener PERSISTENTE (nunca removido,
- * diferente do antigo `onFirstInteraction` de uma vez só) — é o que permite
- * `handleRouteChange` saber se a navegação atual nasceu de um clique, sem
- * depender de a app instrumentar o clique manualmente.
- *
- * INTG-0139 A13 — achado do A12: usar `navChangeTs` (instante do `pushState`)
- * como referência pra T1/T3/T4 deixa a medição cega à espera de servidor em
- * apps com SSR (App Router do Next só chama `pushState` DEPOIS do RSC
- * responder) — o card inteiro existe pra medir isso, então "otimista demais"
- * é o pior tipo de erro aqui. `lastClickConsumed` resolve isso: em vez de um
- * teto de tempo (`MAX_CLICK_TO_NAV_GAP_MS`, removido — ele fazia o clique
- * "expirar" e T0 sumir justo nas navegações mais lentas, o caso que mais
- * importa medir), cada clique é usado como `routeStartTs` de NO MÁXIMO uma
- * navegação — não importa quanto tempo essa navegação demorar. Só cai de
- * volta pro instante do `pushState` quando não há clique rastreável (ex.:
- * `popstate` por atalho de teclado, navegação programática sem clique).
- */
-let lastClickTs: number | null = null;
-let lastClickConsumed = true;
 let navHooksInstalled = false;
 
 /**
- * INTG-0139 A15 — achado do A14: um clique que NÃO navega (ex.: clicar num
- * `<h1>`) ficava pendente sem teto e era consumido por uma navegação
- * totalmente não relacionada depois (ex.: `popstate` do botão voltar,
- * minutos depois) — reintroduzia o defeito do A10 por outro caminho, e
- * ainda inventava um T0 que nunca aconteceu. Dois reforços, não um só:
+ * INTG-0139 A17 — troca de mecanismo (decisão do Fioda, 30/09/2026), não mais
+ * um remendo. As versões 0.2.0 a 0.2.3 tentaram adivinhar "qual clique causou
+ * esta navegação" com uma heurística implícita (listener de clique global +
+ * flag de consumo). Cada rodada de verificação achou um bug novo e distinto
+ * no mesmo mecanismo (A10, A12, A14, A16 — 4 reprovações seguidas): o clique
+ * herdava tempo da tela anterior, não incluía espera de servidor, um clique
+ * órfão contaminava uma navegação não relacionada via `popstate`, e o
+ * `replaceState` que o próprio Next App Router dispara durante `popstate`
+ * consumia o clique antes do listener da lib rodar. O padrão mostrou que
+ * NENHUMA heurística implícita segura contra a variedade de como frameworks
+ * de roteamento disparam `history.*` por baixo dos panos — não é mais um bug
+ * pontual, é o desenho.
  *
- * 1. `popstate` NUNCA consome clique pendente — botão voltar/avançar,
- *    atalho de teclado ou `history.back()` programático não são causados
- *    por um clique na página atual, então não faz sentido atribuir um a
- *    ele. Só `pushState`/`replaceState` (que é como Link/router.push
- *    disparam navegação de verdade) podem consumir.
- * 2. Teto de segurança generoso pro consumo via pushState/replaceState —
- *    bem acima de qualquer espera de RSC realista (a A13 testou até 5s),
- *    mas finito, pra um clique não ficar pendente pra sempre se a app
- *    nunca navegar de verdade depois dele.
+ * A troca: a lib não tenta mais adivinhar nada. `pendingNavStartTs` só existe
+ * quando a APP chama `beginNavigation()` explicitamente, no ponto exato onde
+ * decide navegar — determinístico, porque é a app controlando a ordem, não a
+ * lib torcendo pra um listener rodar antes de outro. É OPCIONAL e afeta só o
+ * T0; T1/T3/T4 dependem exclusivamente do instante real do evento de
+ * navegação (`pushState`/`replaceState`/`popstate`), nunca de clique.
  */
-const MAX_CLICK_STALENESS_MS = 30_000;
+let pendingNavStartTs: number | null = null;
 
 function nowMs(): number {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
@@ -210,12 +194,9 @@ export function init(config: TelemetriaConfig): void {
   const sampleRate = config.sampleRate ?? 1;
   const sampledIn = shouldSample(sampleRate);
 
+  const rawPath = typeof location !== "undefined" ? location.pathname : "/";
   const route =
-    config.route ??
-    normalizeRoute(
-      typeof location !== "undefined" ? location.pathname : "/",
-      { extraStaticSegments: config.extraStaticSegments },
-    );
+    config.route ?? normalizeRoute(rawPath, { extraStaticSegments: config.extraStaticSegments });
 
   state = {
     config: {
@@ -238,6 +219,7 @@ export function init(config: TelemetriaConfig): void {
     // 0 no boot: performance.now()/FCP/loadEventEnd já são nativamente
     // relativos ao início da navegação, subtrair 0 preserva o valor.
     routeStartTs: 0,
+    rawPath,
   };
 
   if (!sampledIn) {
@@ -296,102 +278,108 @@ function recordInitialMarks(): void {
 }
 
 /**
- * Troca de rota client-side (SPA). `newRoute` já é o valor de retorno de
- * `normalizeRoute` no instante da chamada — recalculado aqui e não passado
- * pelo chamador porque `handleRouteChange` é o único ponto de entrada tanto
- * do wrapper de pushState/replaceState quanto do listener de `popstate`.
+ * Marca explicitamente o INÍCIO de uma navegação — no ponto exato onde a app
+ * decide navegar (ex.: dentro do `onClick` do item de menu, antes de chamar
+ * `router.push`), nunca genérica pra todo clique da página. INTG-0139 A17:
+ * é o que faz T0 (reação → próximo quadro pintado) existir de novo depois da
+ * troca de mecanismo — mas é OPCIONAL e afeta só o T0. T1/T3/T4 nunca
+ * dependem dela: são medidos sempre a partir do instante REAL do evento de
+ * navegação (ver `handleRouteChange`), determinístico, sem depender de a app
+ * lembrar de chamar isso.
+ *
+ * Não espalhe por todo lugar que navega — só nos pontos de navegação
+ * principais que valem a pena medir T0 (ex.: item de menu, ação primária).
+ * Chamada consumida pela PRÓXIMA troca de rota real, de qualquer tipo
+ * (`pushState`/`replaceState`/`popstate`); se nenhuma navegação vier depois,
+ * fica inerte até a próxima chamada de `beginNavigation()` sobrescrevê-la —
+ * por isso deve ficar restrita a pontos que de fato levam a uma navegação.
+ */
+export function beginNavigation(): void {
+  pendingNavStartTs = nowMs();
+}
+
+/**
+ * Troca de rota client-side (SPA). Único ponto de entrada do wrapper de
+ * `pushState`/`replaceState` e do listener de `popstate`.
+ *
+ * INTG-0139 A17 — troca de mecanismo: a decisão de abrir um ciclo novo depende
+ * SÓ do `location.pathname` CRU ter mudado (nunca de heurística de clique).
+ * `routeStartTs` é sempre o instante deste evento de navegação — nunca o de
+ * um clique anterior. Isso resolve de uma vez os 3 furos que a heurística de
+ * clique (0.2.0-0.2.3) não conseguiu fechar em 4 rodadas de correção:
+ * `replaceState` disparado pelo próprio router durante `popstate` (F1),
+ * navegação programática depois de um clique órfão (F2), e o listener de
+ * `popstate` de um router rodando antes do da lib (F3) — nenhum deles
+ * consegue mais "roubar" um clique que não é dele, porque não existe mais
+ * clique nenhum sendo rastreado.
+ *
+ * `pendingNavStartTs` (de `beginNavigation()`) é consumido aqui, sempre que
+ * existir, SÓ pra calcular o T0 — nunca influencia `routeStartTs`.
  *
  * Fecha o ciclo da rota anterior (flush do que estiver pendente) ANTES de
- * trocar `state.config.route` — é o que garante que os eventos da rota
- * antiga cheguem no `TelemetriaConsolidadoDiario` com a rota certa, mesmo
- * que o buffer ainda tivesse itens não drenados. O buffer em si NÃO é
- * recriado (só flushado): recriar zeraria `totalAccepted` e o teto de
- * eventos por sessão (spec A02) passaria a valer por rota, não por sessão.
- *
- * `allowClickConsumption` (A15): só `true` quando chamado a partir do
- * wrapper de `pushState`/`replaceState` — `popstate` nunca consome clique
- * pendente (ver comentário de `MAX_CLICK_STALENESS_MS`).
+ * trocar `state.rawPath`/`state.config.route` — garante que os eventos da
+ * rota antiga cheguem com a rota certa, mesmo com o buffer ainda tendo itens
+ * não drenados. O buffer em si NÃO é recriado (só flushado): recriar
+ * zeraria `totalAccepted` e o teto de eventos por sessão (spec A02) passaria
+ * a valer por rota, não por sessão.
  */
-function handleRouteChange(allowClickConsumption: boolean): void {
+function handleRouteChange(): void {
   if (!state) return;
 
-  const newRoute = normalizeRoute(
-    typeof location !== "undefined" ? location.pathname : "/",
-    { extraStaticSegments: state.config.extraStaticSegments },
-  );
-  if (newRoute === state.config.route) return; // ex.: pushState só de query string
+  const rawPath = typeof location !== "undefined" ? location.pathname : "/";
+  // A17 (achado F4 do A16): compara o PATHNAME CRU, não a rota normalizada —
+  // duas telas do mesmo molde (`/card/1` → `/card/2`, ambas `/card/[id]`)
+  // agora abrem ciclo novo; mudança só de query string (pathname igual)
+  // continua sendo no-op, como sempre foi.
+  if (rawPath === state.rawPath) return;
 
   flushNow();
 
   const navChangeTs = nowMs();
+  const usedNavStartTs = pendingNavStartTs;
+  pendingNavStartTs = null; // consumo único — não vaza pra próxima navegação
 
-  // A13: usa o clique como referência (routeStartTs) quando ele ainda não
-  // foi consumido por outra navegação. Em SSR (App Router), navChangeTs
-  // (pushState) só acontece DEPOIS do servidor responder; usar o clique
-  // aqui é o que faz T1/T3/T4 incluírem a espera de rede, em vez de medir
-  // só o trabalho no cliente depois que ela já passou (achado real do A12:
-  // T3 ficava constante mesmo com 3,6s de atraso real no servidor).
-  //
-  // A15: só é elegível se (a) esta navegação pode consumir clique
-  // (pushState/replaceState, nunca popstate) e (b) o clique não está mais
-  // velho que MAX_CLICK_STALENESS_MS — sem isso, um clique que não navegou
-  // (ex.: clicar num `<h1>`) ficava pendente pra sempre e contaminava a
-  // PRÓXIMA navegação de qualquer tipo, minutos depois (achado real do A14).
-  const clickIsFresh =
-    lastClickTs != null && navChangeTs - lastClickTs <= MAX_CLICK_STALENESS_MS;
-  const usedClickTs =
-    allowClickConsumption && !lastClickConsumed && clickIsFresh ? lastClickTs : null;
-  if (usedClickTs != null) lastClickConsumed = true;
-
-  state.config.route = newRoute;
-  // A11: todo marco recordMark() gravado a partir daqui — automático (T1/T4)
-  // OU manual (T2/T3 via mark(), achado real do A10) — passa a ser relativo
-  // a este instante, não mais ao início absoluto do documento. A13: essa
-  // referência agora é o clique (quando existe), não mais o pushState.
-  state.routeStartTs = usedClickTs ?? navChangeTs;
+  state.rawPath = rawPath;
+  state.config.route = normalizeRoute(rawPath, {
+    extraStaticSegments: state.config.extraStaticSegments,
+  });
+  // routeStartTs é SEMPRE o instante deste evento de navegação — nunca o de
+  // beginNavigation()/clique. T1/T3/T4 não incluem, portanto, o tempo entre
+  // a intenção de navegar e o pushState de fato disparar (ex.: espera de RSC
+  // em SSR) — trade-off aceito conscientemente pela robustez (ver nota da
+  // função). Quem precisar medir essa espera de ponta a ponta pode encadear
+  // `beginNavigation()` com marcos manuais próprios.
+  state.routeStartTs = navChangeTs;
 
   if (!state.sampledIn) return;
 
   doubleRaf(() => {
-    if (!state || state.config.route !== newRoute) return; // outra navegação já aconteceu
-    // T0 mede clique->próximo quadro pintado — só existe quando há clique
-    // rastreável. Sem clique (ex.: popstate por atalho de teclado), não há
-    // T0 (nunca inventa um valor), mas T1/T3/T4 continuam medidos a partir
-    // do pushState (usedClickTs == null → routeStartTs == navChangeTs).
-    if (usedClickTs != null) {
-      recordDuration("T0", nowMs() - usedClickTs);
+    if (!state || state.rawPath !== rawPath) return; // outra navegação já aconteceu
+    // T0 só existe quando a app chamou beginNavigation() antes desta
+    // navegação — nunca inventa um valor sem isso.
+    if (usedNavStartTs != null) {
+      recordDuration("T0", nowMs() - usedNavStartTs);
     }
     recordMark("T1"); // nowMs() (default) - routeStartTs = duração até este paint
   });
 
   onIdle(() => {
-    if (!state || state.config.route !== newRoute) return;
+    if (!state || state.rawPath !== rawPath) return;
     recordMark("T4"); // idem: nowMs() (default) - routeStartTs
   });
 }
 
 /**
  * Instrumenta `history.pushState`/`replaceState` (o App Router do Next e
- * praticamente toda SPA passam por eles, com ou sem `popstate` — o navegador
- * não dispara `popstate` sozinho pra navegação programática) + `popstate`
- * (botão voltar/avançar) + um listener de clique PERSISTENTE pra alimentar
- * `lastClickTs`. Idempotente: chamado a cada `init()`, mas só instala uma vez
- * por `globalThis` — `__resetForTest` zera a flag pra testes que trocam o
+ * praticamente toda SPA passam por eles) + `popstate` (botão voltar/avançar).
+ * Idempotente: chamado a cada `init()`, mas só instala uma vez por
+ * `globalThis` — `__resetForTest` zera a flag pra testes que trocam o
  * `window`/`history` global a cada rodada.
  */
 function installNavigationHooks(): void {
   if (navHooksInstalled) return;
   if (typeof window === "undefined" || typeof history === "undefined") return;
   navHooksInstalled = true;
-
-  window.addEventListener(
-    "click",
-    () => {
-      lastClickTs = nowMs();
-      lastClickConsumed = false; // A13: disponível pra ser usado como routeStartTs da próxima navegação
-    },
-    { capture: true, passive: true },
-  );
 
   (["pushState", "replaceState"] as const).forEach((method) => {
     const original = history[method];
@@ -400,15 +388,12 @@ function installNavigationHooks(): void {
       ...args: Parameters<History[typeof method]>
     ): ReturnType<History[typeof method]> {
       const result = original.apply(this, args);
-      handleRouteChange(true); // pushState/replaceState: pode consumir clique pendente
+      handleRouteChange();
       return result;
     } as History[typeof method];
   });
 
-  // popstate NUNCA consome clique pendente (A15) — botão voltar/avançar,
-  // atalho de teclado ou history.back() programático não são causados por
-  // um clique na página atual.
-  window.addEventListener("popstate", () => handleRouteChange(false));
+  window.addEventListener("popstate", () => handleRouteChange());
 }
 
 /**
@@ -505,17 +490,9 @@ export function __getStateForTest(): TelemetriaState | null {
 export function __resetForTest(): void {
   state = null;
   pendingMarks = [];
-  lastClickTs = null;
-  lastClickConsumed = true;
+  pendingNavStartTs = null;
   // `navHooksInstalled` zera pra permitir reinstalar contra um novo shim de
   // window/history a cada teste (INTG-0139 A09) — sem isso, o segundo teste
   // que troca o globalThis.window herdaria o wrapper preso ao objeto antigo.
   navHooksInstalled = false;
-}
-
-/** Só para teste — simula um clique disponível pra virar routeStartTs/T0 da
- * próxima navegação. Não é API pública estável. */
-export function __simulateClickForTest(): void {
-  lastClickTs = nowMs();
-  lastClickConsumed = false;
 }

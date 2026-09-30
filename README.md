@@ -126,67 +126,81 @@ marcos chegaram, antes dos marcos automáticos do próprio `init()` (T0/T1/T4).
 Não é preciso nenhum código extra na app pra isso funcionar — é o
 comportamento padrão de `mark()`.
 
-## Navegação client-side (SPA) — desde 0.2.0
+## Navegação client-side (SPA) — desde 0.3.0
 
 A lib percebe navegação DENTRO do app sozinha: assim que `init()` roda uma
 vez, `pushState`/`replaceState`/`popstate` ficam instrumentados (App Router
 do Next passa por `pushState`, mas a instrumentação é framework-agnóstica —
-funciona em qualquer SPA). **Não é preciso chamar `init()` de novo a cada
-troca de rota** — isso continua funcionando, mas é um reset completo (zera o
-teto de eventos da sessão); pra troca de rota normal, deixe a lib perceber
-sozinha.
+funciona em qualquer SPA). **A decisão de abrir um ciclo novo depende só do
+`location.pathname` CRU ter mudado** — nunca de clique, nunca de heurística.
+**Não é preciso chamar `init()` de novo a cada troca de rota** — isso
+continua funcionando, mas é um reset completo (zera o teto de eventos da
+sessão); pra troca de rota normal, deixe a lib perceber sozinha.
 
 A cada troca de rota, a lib fecha o ciclo da tela anterior (envia o que
-estiver pendente com a rota certa) e abre um ciclo novo — T0/T1/T2/T3/T4 da
+estiver pendente com a rota certa) e abre um ciclo novo — T1/T2/T3/T4 da
 rota nova nunca herdam valor da rota anterior nem do boot original.
 `sessionId` e o teto de eventos por sessão continuam os mesmos durante toda a
 navegação: trocar de rota não é uma sessão nova, é a mesma sessão vendo
 outra tela.
 
-**Achado corrigido na 0.2.3:** a 0.2.2 removeu o teto de tempo pra um clique
-virar `routeStartTs`, mas isso abriu outro furo — um clique que NÃO leva a
-navegação nenhuma (ex.: clicar num título) ficava pendente pra sempre e era
-consumido pela PRÓXIMA navegação de qualquer tipo, minutos depois, sem
-relação nenhuma com aquele clique (inclusive inventando um T0 que nunca
-aconteceu). Corrigido com dois reforços: **`popstate` nunca consome clique
-pendente** (botão voltar/avançar não é causado por um clique na página
-atual — só `pushState`/`replaceState` podem consumir), e um **teto de
-segurança de 30s** pro consumo via `pushState`/`replaceState` (bem acima de
-qualquer espera de RSC realista, só pra um clique não ficar pendente pra
-sempre se a app nunca navegar de verdade depois dele).
+### `beginNavigation()` — opcional, só afeta o T0
 
-**Achado corrigido na 0.2.2:** em apps com SSR (App Router do Next), o
-`pushState` só acontece DEPOIS do servidor responder (RSC) — usar esse
-instante como referência (`routeStartTs`) deixava T1/T3/T4 cegos pra espera
-de rede: com 3,6s reais de atraso no servidor, o T3 gravado continuava
-~0,6s. Corrigido usando o CLIQUE como referência quando ele existe, caindo
-de volta pro `pushState` só quando não há clique rastreável.
+```ts
+import { beginNavigation } from "@integrattion/telemetria";
 
-**Achado corrigido na 0.2.1:** a 0.2.0 corrigiu T0/T1/T4, mas `mark()`
-(T2/T3) continuava gravando um instante absoluto desde o início do
-DOCUMENTO — em produção simulada, o T3 de uma tela aberta por clique crescia
-junto com o tempo que o usuário ficava parado na tela ANTERIOR, em vez de
-refletir o tempo real da rota nova. Achado do verificador comparando o
-tempo real clique→pronto contra o valor gravado, com permanências
-diferentes na tela anterior. Corrigido com `routeStartTs`: todo marco
-passa a ser relativo ao início do ciclo da rota atual, não ao início do
-documento.
+// no ponto EXATO onde a app decide navegar (ex.: dentro do onClick do
+// item de menu, antes de chamar router.push) — não espalhe por todo
+// lugar que navega, só nos pontos que valem a pena medir T0.
+onMenuItemClick(() => {
+  beginNavigation();
+  router.push("/dashboard");
+});
+```
 
-**Achado corrigido na 0.2.0 (INTG-0139 A09):** antes disso, `init()` fixava a
-rota uma única vez no boot; toda tela aberta depois por clique (SPA) gravava
-T1/T3/T4 com o tempo herdado da carga original, inflado — o card inteiro
-dependia dessa correção pra medir o OS (que é SPA) e qualquer sistema
-plugado que não seja boot direto a cada tela.
+Chamar `beginNavigation()` antes de uma troca de rota faz a lib gravar T0
+(duração real de `beginNavigation()` até o próximo quadro pintado). Sem essa
+chamada, T0 simplesmente não existe naquela navegação — a lib nunca inventa
+um valor. **T1/T3/T4 nunca dependem de `beginNavigation()`**: são sempre
+medidos a partir do instante real do evento de navegação
+(`pushState`/`replaceState`/`popstate`), determinístico, sem depender de a
+app lembrar de chamar nada.
+
+**Trade-off aceito conscientemente:** em apps com SSR (App Router do Next),
+`pushState` só dispara DEPOIS do servidor responder (RSC) — T1/T3/T4 não
+incluem, portanto, a espera de rede entre a intenção de navegar e a troca de
+rota efetiva. Quem precisar medir esse tempo de ponta a ponta pode encadear
+`beginNavigation()` com marcos manuais próprios.
+
+### Por que a versão mudou de mecanismo na 0.3.0
+
+As versões 0.2.0-0.2.3 tentaram adivinhar "qual clique causou esta
+navegação" com uma heurística implícita (listener de clique global + flag de
+consumo). Quatro rodadas de verificação seguidas acharam um bug novo e
+distinto no mesmo mecanismo: o clique herdava tempo da tela anterior
+(0.2.1), não incluía espera de servidor (0.2.2), um clique órfão contaminava
+uma navegação não relacionada via `popstate` (0.2.3), e o `replaceState` que
+o próprio Next App Router dispara durante `popstate` consumia o clique antes
+do listener da lib rodar. O padrão mostrou que nenhuma heurística implícita
+segura contra a variedade de como frameworks de roteamento disparam
+`history.*` — não era mais um bug pontual, era o desenho. Decisão: parar de
+adivinhar, e deixar a app dizer explicitamente quando quer que T0 exista.
+
+**Achado corrigido junto (F4):** comparar a rota NORMALIZADA pra decidir se
+houve troca fazia duas telas do MESMO MOLDE (ex.: `/card/1` → `/card/2`,
+ambas `/card/[id]`) nunca abrirem ciclo novo — existe de verdade em telas
+tipo card a card, projeto a projeto. Corrigido comparando o `pathname` cru; a
+rota normalizada continua servindo só pra rotular/agregar no consolidado.
 
 ## Marcos medidos
 
 | Marco | Significado | Como é obtido |
 |---|---|---|
-| T0 | Reação ao clique que motivou a navegação | Automático, só em navegação client-side: duração real do clique até o próximo quadro pintado (`requestAnimationFrame` duplo). **Não é emitido no boot inicial** — não existe um clique prévio que motivou o carregamento da primeira página. Só é emitido se um clique aconteceu nos últimos 3s antes da troca de rota (senão a navegação não veio de um clique rastreável, ex.: `popstate` por atalho de teclado). |
-| T1 | Estrutura na tela | Boot inicial: `first-contentful-paint` (via `PerformanceObserver`/`getEntriesByType('paint')`). Navegação client-side: duração da troca de rota até o próximo quadro pintado (mesmo duplo `requestAnimationFrame` do T0). |
+| T0 | Reação (intenção de navegar → próximo quadro pintado) | Só existe se a app chamou `beginNavigation()` antes da troca de rota. **Nunca inventado** — sem essa chamada, T0 não existe naquela navegação (nem no boot inicial). |
+| T1 | Estrutura na tela | Boot inicial: `first-contentful-paint` (via `PerformanceObserver`/`getEntriesByType('paint')`). Navegação client-side: duração do evento de navegação até o próximo quadro pintado (`requestAnimationFrame` duplo) — sempre, com ou sem `beginNavigation()`. |
 | T2 | Contexto carregado | Manual — `mark('context-ready')`, ou implícito junto com T3 se só `mark('action-ready')` for chamado (ver abaixo). Sempre da rota atual. |
 | T3 | Pronto pra agir | Manual — `mark('action-ready')`. Sempre da rota atual — chamar em uma rota nunca aparece na rota anterior nem na seguinte. |
-| T4 | Completo | Boot inicial: `loadEventEnd` da `PerformanceNavigationTiming`. Navegação client-side: duração da troca de rota até o navegador ficar ocioso (`requestIdleCallback`), como aproximação de "terminou de assentar" — SPA não tem um evento `load` por rota. |
+| T4 | Completo | Boot inicial: `loadEventEnd` da `PerformanceNavigationTiming`. Navegação client-side: duração do evento de navegação até o navegador ficar ocioso (`requestIdleCallback`), como aproximação de "terminou de assentar" — SPA não tem um evento `load` por rota. |
 
 **T2 e T3 pela mesma chamada.** Por decisão da spec A02, `mark('action-ready')`
 grava T2 e T3 no mesmo timestamp — é o mínimo que uma app precisa chamar.
@@ -293,10 +307,11 @@ card). Este é o contrato que a lib envia e que a rota deve aceitar:
 ## API
 
 ```ts
-import { init, mark, flush, normalizeRoute } from "@integrattion/telemetria";
+import { init, mark, beginNavigation, flush, normalizeRoute } from "@integrattion/telemetria";
 
 init(config: TelemetriaConfig): void;
 mark(name: string): void;
+beginNavigation(): void; // opcional — só afeta o T0, chame antes de navegar
 flush(): void; // força o envio do buffer pendente
 normalizeRoute(pathname: string, options?: NormalizeRouteOptions): string;
 ```

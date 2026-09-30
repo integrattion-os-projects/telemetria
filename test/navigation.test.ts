@@ -33,12 +33,11 @@ if (!("self" in g)) g.self = globalThis;
 type Listener = () => void;
 
 function installFreshBrowserShim(pathname: string): {
-  fireClick: () => void;
   fireRaf: () => void;
   fireIdle: () => void;
   firePopstate: () => void;
 } {
-  const listeners: Record<string, Listener[]> = { click: [], popstate: [] };
+  const listeners: Record<string, Listener[]> = { popstate: [] };
   const fakeWindow = {
     addEventListener: (type: string, cb: Listener) => {
       (listeners[type] ??= []).push(cb);
@@ -69,7 +68,6 @@ function installFreshBrowserShim(pathname: string): {
   };
 
   return {
-    fireClick: () => listeners.click.forEach((cb) => cb()),
     fireRaf: () => {
       // doubleRaf agenda o 2º rAF só de dentro do 1º callback — drenar em
       // duas rodadas cobre isso sem a chamadora precisar saber da mecânica.
@@ -91,6 +89,10 @@ function installFreshBrowserShim(pathname: string): {
 
 function setPathname(pathname: string): void {
   (g.location as { pathname: string }).pathname = pathname;
+}
+
+function pushState(): void {
+  (g.history as { pushState: () => void }).pushState();
 }
 
 const telemetria = await import("../dist/index.js");
@@ -144,9 +146,23 @@ function withFakeFetch<T>(run: (calls: CapturedCall[]) => T): T {
   return result;
 }
 
-function payloadsFromCalls(calls: CapturedCall[]): Array<{ route: string; marks: Array<{ name: string; timestamp: number }> }> {
+function payloadsFromCalls(
+  calls: CapturedCall[],
+): Array<{ route: string; marks: Array<{ name: string; timestamp: number }> }> {
   return calls.map((call) => JSON.parse(call.body));
 }
+
+// ---------------------------------------------------------------------------
+// INTG-0139 A17 — troca de mecanismo. As versões 0.2.0-0.2.3 tentavam
+// adivinhar "qual clique causou esta navegação" com uma heurística implícita
+// (listener de clique global + flag de consumo). 4 rodadas de verificação
+// seguidas (A10, A12, A14, A16) acharam um bug novo e distinto no mesmo
+// mecanismo — o padrão mostrou que o problema era o DESENHO, não um bug
+// pontual. Decisão do Fioda (30/09/2026): a lib não tenta mais adivinhar
+// nada. Troca de rota (pushState/replaceState/popstate, comparando o
+// pathname CRU) abre o ciclo novo sozinha, sempre, determinística — T1/T3/T4
+// dependem só disso. `beginNavigation()` é opcional e afeta só o T0.
+// ---------------------------------------------------------------------------
 
 test("duas navegações seguidas (pushState) geram dois conjuntos de marcos, cada um com a rota certa", () => {
   telemetria.__resetForTest();
@@ -154,7 +170,7 @@ test("duas navegações seguidas (pushState) geram dois conjuntos de marcos, cad
 
   withFakeFetch((calls) => {
     telemetria.init({
-      entitySlug: "teste-a09",
+      entitySlug: "teste-a17",
       endpoint: "http://localhost/telemetria-teste",
       sampleRate: 1,
       batchSize: 1000,
@@ -162,7 +178,7 @@ test("duas navegações seguidas (pushState) geram dois conjuntos de marcos, cad
     telemetria.flush(); // fecha o ciclo do boot (/inicio) antes de navegar
 
     setPathname("/pagina-b");
-    (g.history as { pushState: () => void }).pushState();
+    pushState();
     shim.fireRaf();
     shim.fireIdle();
     telemetria.mark("action-ready");
@@ -185,18 +201,16 @@ test("duas navegações seguidas (pushState) geram dois conjuntos de marcos, cad
 });
 
 test("T3 (mark) não cresce com o tempo parado na tela anterior — regressão do achado A10", async () => {
-  // A10 encontrou T3 absoluto (nowMs() desde o início do documento) mesmo
-  // depois do A09 corrigir T0/T1/T4: o valor gravado crescia junto com a
-  // PERMANÊNCIA na tela anterior, em vez de refletir o tempo real da rota
-  // nova. O teste antigo só conferia `nomes.includes("T3")`, nunca o valor —
-  // por isso não pegou. Este replica o cenário: espera de verdade ANTES de
-  // navegar, e confirma que o T3 da rota nova continua pequeno.
+  // A10 encontrou T3 absoluto (nowMs() desde o início do documento): o valor
+  // gravado crescia junto com a PERMANÊNCIA na tela anterior, em vez de
+  // refletir o tempo real da rota nova. Continua valendo no novo mecanismo:
+  // routeStartTs é sempre o instante do evento de navegação.
   telemetria.__resetForTest();
   const shim = installFreshBrowserShim("/inicio");
 
   await withFakeFetch(async (calls) => {
     telemetria.init({
-      entitySlug: "teste-a11-regressao-t3",
+      entitySlug: "teste-a17-regressao-t3",
       endpoint: "http://localhost/telemetria-teste",
       sampleRate: 1,
       batchSize: 1000,
@@ -208,7 +222,7 @@ test("T3 (mark) não cresce com o tempo parado na tela anterior — regressão d
     await new Promise((resolve) => setTimeout(resolve, 300));
 
     setPathname("/pagina-depois-de-espera");
-    (g.history as { pushState: () => void }).pushState();
+    pushState();
     shim.fireRaf();
     shim.fireIdle();
     telemetria.mark("action-ready"); // T3 da rota nova, gravado logo após navegar
@@ -220,167 +234,222 @@ test("T3 (mark) não cresce com o tempo parado na tela anterior — regressão d
     assert.ok(t3, "T3 precisa existir");
     assert.ok(
       t3!.timestamp < 50,
-      `T3 deveria ser pequeno (mark() chamado logo após navegar), mas veio ${t3!.timestamp}ms — ` +
-        `sinal de que herdou os 300ms de permanência na tela anterior (regressão do achado A10)`,
+      `T3 deveria ser pequeno (mark() chamado logo após navegar), mas veio ${t3!.timestamp}ms`,
     );
   });
 });
 
-test("T3 inclui a espera de rede entre o clique e o pushState (SSR/App Router) — regressão do achado A12", async () => {
-  // A12 encontrou que routeStartTs usava o instante do pushState — em apps
-  // com SSR (App Router do Next), pushState só acontece DEPOIS do servidor
-  // responder, então T1/T3/T4 não incluíam a espera de rede: com 3,6s reais
-  // de atraso no servidor, o T3 gravado continuava ~0,6s (o clique já tinha
-  // acontecido havia tempo). Este teste simula exatamente essa topologia:
-  // clique -> espera real (proxy da ida ao servidor) -> só ENTÃO pushState.
-  telemetria.__resetForTest();
-  const shim = installFreshBrowserShim("/inicio");
-
-  await withFakeFetch(async (calls) => {
-    telemetria.init({
-      entitySlug: "teste-a13-regressao-rsc",
-      endpoint: "http://localhost/telemetria-teste",
-      sampleRate: 1,
-      batchSize: 1000,
-    });
-    telemetria.flush();
-
-    shim.fireClick(); // usuário clica — o "servidor" começa a responder agora
-    await new Promise((resolve) => setTimeout(resolve, 200)); // proxy da espera de RSC
-    setPathname("/pagina-lenta");
-    (g.history as { pushState: () => void }).pushState(); // só agora o router troca a rota
-    shim.fireRaf();
-    shim.fireIdle();
-    telemetria.mark("action-ready");
-    telemetria.flush();
-
-    const rotaLenta = payloadsFromCalls(calls).find((p) => p.route === "/pagina-lenta");
-    assert.ok(rotaLenta, "precisa existir payload da rota lenta");
-    const t3 = rotaLenta!.marks.find((m) => m.name === "T3");
-    const t0 = rotaLenta!.marks.find((m) => m.name === "T0");
-    assert.ok(t3, "T3 precisa existir");
-    assert.ok(t0, "T0 precisa existir (havia um clique rastreável antes do pushState)");
-    assert.ok(
-      t3!.timestamp >= 200,
-      `T3 deveria incluir os ~200ms de espera entre o clique e o pushState, mas veio ${t3!.timestamp}ms — ` +
-        `sinal de que a referência ainda é o pushState, não o clique (regressão do achado A12)`,
-    );
-  });
-});
-
-test("clique que não navega não contamina uma navegação não relacionada depois (popstate) — regressão do achado A14", async () => {
-  // A14 encontrou: um clique que NÃO leva a navegação nenhuma (ex.: clicar
-  // num <h1>) ficava pendente sem teto, e era consumido pela PRÓXIMA
-  // navegação de qualquer tipo — inclusive popstate do botão voltar, minutos
-  // depois, sem relação nenhuma com aquele clique. Reintroduzia o defeito do
-  // A10 por outro caminho, e ainda inventava um T0 que nunca aconteceu.
-  telemetria.__resetForTest();
-  const shim = installFreshBrowserShim("/inicio");
-
-  await withFakeFetch(async (calls) => {
-    telemetria.init({
-      entitySlug: "teste-a15-clique-orfao",
-      endpoint: "http://localhost/telemetria-teste",
-      sampleRate: 1,
-      batchSize: 1000,
-    });
-    telemetria.flush();
-
-    shim.fireClick(); // clique que NÃO leva a pushState/replaceState nenhum
-    await new Promise((resolve) => setTimeout(resolve, 300)); // usuário lê a tela
-
-    setPathname("/pagina-depois-de-voltar");
-    shim.firePopstate(); // botão voltar — não tem relação com o clique acima
-    shim.fireRaf();
-    shim.fireIdle();
-    telemetria.mark("action-ready");
-    telemetria.flush();
-
-    const rotaNova = payloadsFromCalls(calls).find((p) => p.route === "/pagina-depois-de-voltar");
-    assert.ok(rotaNova, "precisa existir payload da rota nova");
-
-    const t0 = rotaNova!.marks.find((m) => m.name === "T0");
-    assert.ok(!t0, `T0 não deveria existir (popstate não tem clique associado), mas veio ${t0?.timestamp}ms`);
-
-    const t3 = rotaNova!.marks.find((m) => m.name === "T3");
-    assert.ok(t3, "T3 precisa existir");
-    assert.ok(
-      t3!.timestamp < 50,
-      `T3 deveria ser pequeno (mark() chamado logo após o popstate), mas veio ${t3!.timestamp}ms — ` +
-        `sinal de que o clique órfão contaminou esta navegação (regressão do achado A14)`,
-    );
-  });
-});
-
-test("T0 da navegação é medido do clique ao próximo quadro pintado, não herdado da carga inicial", () => {
+test("navegação SEM beginNavigation() nunca inventa T0", () => {
   telemetria.__resetForTest();
   const shim = installFreshBrowserShim("/inicio");
 
   withFakeFetch((calls) => {
     telemetria.init({
-      entitySlug: "teste-a09-t0",
+      entitySlug: "teste-a17-sem-begin-nav",
       endpoint: "http://localhost/telemetria-teste",
       sampleRate: 1,
       batchSize: 1000,
     });
     telemetria.flush();
 
-    // Sem T0 no boot inicial (achado do C01: não existe clique prévio que
-    // motivou o carregamento original).
+    // Boot inicial: nunca teve T0 (não existe clique/intenção prévia).
     const bootPayload = payloadsFromCalls(calls).find((p) => p.route === "/inicio");
     assert.ok(!bootPayload?.marks.some((m) => m.name === "T0"), "boot inicial não emite T0");
 
-    shim.fireClick(); // usuário clica num link — dispara a navegação
     setPathname("/pagina-c");
-    (g.history as { pushState: () => void }).pushState();
+    pushState(); // navegação sem beginNavigation() antes
     shim.fireRaf();
     shim.fireIdle();
     telemetria.flush();
 
     const rotaC = payloadsFromCalls(calls).find((p) => p.route === "/pagina-c");
     assert.ok(rotaC, "precisa existir payload da rota /pagina-c");
-    const t0 = rotaC!.marks.find((m) => m.name === "T0");
-    assert.ok(t0, "T0 precisa existir quando há clique recente antes da navegação");
-    assert.ok(t0!.timestamp >= 0, "T0 é uma duração real (clique → paint), não um instante absoluto herdado");
+    assert.ok(
+      !rotaC!.marks.some((m) => m.name === "T0"),
+      "sem beginNavigation() antes, T0 nunca deve ser inventado",
+    );
+    assert.ok(rotaC!.marks.some((m) => m.name === "T1"), "T1 continua existindo, independente de T0");
   });
 });
 
-test("popstate (botão voltar) também dispara um ciclo novo de marcos", () => {
+test("beginNavigation() antes da troca de rota grava T0 real (clique/intenção → próximo quadro pintado)", () => {
   telemetria.__resetForTest();
   const shim = installFreshBrowserShim("/inicio");
-  let popstateHandler: (() => void) | undefined;
 
   withFakeFetch((calls) => {
-    // Intercepta o registro de popstate manualmente pra poder disparar.
-    const originalAdd = (g.window as { addEventListener: (t: string, cb: () => void) => void })
-      .addEventListener;
-    (g.window as { addEventListener: (t: string, cb: () => void) => void }).addEventListener = (
-      type,
-      cb,
-    ) => {
-      if (type === "popstate") popstateHandler = cb;
-      originalAdd(type, cb);
-    };
-
     telemetria.init({
-      entitySlug: "teste-a09-popstate",
+      entitySlug: "teste-a17-com-begin-nav",
       endpoint: "http://localhost/telemetria-teste",
       sampleRate: 1,
       batchSize: 1000,
     });
     telemetria.flush();
 
+    telemetria.beginNavigation(); // app chama no ponto exato onde decide navegar
     setPathname("/pagina-d");
-    assert.ok(popstateHandler, "popstate precisa ter sido registrado por installNavigationHooks");
-    popstateHandler!();
+    pushState();
+    shim.fireRaf();
+    shim.fireIdle();
+    telemetria.flush();
+
+    const rotaD = payloadsFromCalls(calls).find((p) => p.route === "/pagina-d");
+    assert.ok(rotaD, "precisa existir payload da rota /pagina-d");
+    const t0 = rotaD!.marks.find((m) => m.name === "T0");
+    assert.ok(t0, "T0 precisa existir quando beginNavigation() foi chamada antes da navegação");
+    assert.ok(t0!.timestamp >= 0, "T0 é uma duração real (beginNavigation → paint)");
+  });
+});
+
+test("beginNavigation() é consumida uma única vez — não vaza pra navegação seguinte", () => {
+  telemetria.__resetForTest();
+  const shim = installFreshBrowserShim("/inicio");
+
+  withFakeFetch((calls) => {
+    telemetria.init({
+      entitySlug: "teste-a17-consumo-unico",
+      endpoint: "http://localhost/telemetria-teste",
+      sampleRate: 1,
+      batchSize: 1000,
+    });
+    telemetria.flush();
+
+    telemetria.beginNavigation();
+    setPathname("/pagina-e");
+    pushState();
+    shim.fireRaf();
+    shim.fireIdle();
+    telemetria.flush();
+
+    // Segunda navegação, SEM nova chamada a beginNavigation() — não deve
+    // reaproveitar a intenção já consumida pela primeira.
+    setPathname("/pagina-f");
+    pushState();
+    shim.fireRaf();
+    shim.fireIdle();
+    telemetria.flush();
+
+    const payloads = payloadsFromCalls(calls);
+    const rotaE = payloads.find((p) => p.route === "/pagina-e");
+    const rotaF = payloads.find((p) => p.route === "/pagina-f");
+    assert.ok(rotaE?.marks.some((m) => m.name === "T0"), "primeira navegação consome a intenção e grava T0");
+    assert.ok(
+      !rotaF?.marks.some((m) => m.name === "T0"),
+      "segunda navegação não deve reaproveitar a intenção já consumida pela primeira",
+    );
+  });
+});
+
+test("popstate (botão voltar) dispara um ciclo novo de marcos, sem depender de beginNavigation()", () => {
+  telemetria.__resetForTest();
+  const shim = installFreshBrowserShim("/inicio");
+
+  withFakeFetch((calls) => {
+    telemetria.init({
+      entitySlug: "teste-a17-popstate",
+      endpoint: "http://localhost/telemetria-teste",
+      sampleRate: 1,
+      batchSize: 1000,
+    });
+    telemetria.flush();
+
+    setPathname("/pagina-g");
+    shim.firePopstate();
     shim.fireRaf();
     shim.fireIdle();
     telemetria.mark("action-ready");
     telemetria.flush();
 
-    const rotaD = payloadsFromCalls(calls).find((p) => p.route === "/pagina-d");
-    assert.ok(rotaD, "popstate precisa ter trocado a rota e gerado payload próprio");
-    assert.ok(rotaD!.marks.some((m) => m.name === "T3"), "T3 da rota D via mark() depois do popstate");
+    const rotaG = payloadsFromCalls(calls).find((p) => p.route === "/pagina-g");
+    assert.ok(rotaG, "popstate precisa ter trocado a rota e gerado payload próprio");
+    assert.ok(rotaG!.marks.some((m) => m.name === "T3"), "T3 da rota G via mark() depois do popstate");
+    assert.ok(!rotaG!.marks.some((m) => m.name === "T0"), "sem beginNavigation(), popstate não inventa T0");
+  });
+});
+
+test("telas do mesmo molde de rota abrem ciclo novo — regressão do achado F4 (A16)", () => {
+  // A16 encontrou: comparar a rota NORMALIZADA pra decidir se houve troca
+  // fazia duas telas do MESMO MOLDE (ex.: /card/1 -> /card/2, ambas
+  // /card/[id]) nunca abrirem ciclo novo — existe de verdade no OS (card a
+  // card, projeto a projeto). Corrigido comparando o pathname CRU.
+  telemetria.__resetForTest();
+  // "cards" (5 letras) em vez de "card" (4 letras) — normalizeRoute tem um
+  // fallback posicional que vira `[id]` qualquer segmento de até 4 letras
+  // só-letras fora da lista de palavras estáticas (ver route.ts); usar
+  // "card" faria o PRÓPRIO segmento estático virar `[id]`, mascarando o
+  // teste. "cards" fica de fora desse fallback e o molde vira /cards/[id].
+  const shim = installFreshBrowserShim("/cards/1");
+
+  withFakeFetch((calls) => {
+    telemetria.init({
+      entitySlug: "teste-a17-f4-mesmo-molde",
+      endpoint: "http://localhost/telemetria-teste",
+      sampleRate: 1,
+      batchSize: 1000,
+    });
+    telemetria.flush();
+
+    setPathname("/cards/2"); // mesmo molde normalizado, pathname CRU diferente
+    pushState();
+    shim.fireRaf();
+    shim.fireIdle();
+    telemetria.mark("action-ready");
+    telemetria.flush();
+
+    const payloads = payloadsFromCalls(calls);
+    const cardDois = payloads.find(
+      (p) => p.route === "/cards/[id]" && p.marks.some((m) => m.name === "T3"),
+    );
+    assert.ok(
+      cardDois,
+      "card a card (mesmo molde de rota) precisa abrir ciclo novo — F4 exige comparar o pathname cru, não a rota normalizada",
+    );
+
+    // O T3 da segunda tela não pode ter vazado pro payload do card 1 (boot).
+    const bootPayload = payloads.find(
+      (p) => p.route === "/cards/[id]" && !p.marks.some((m) => m.name === "T3"),
+    );
+    assert.ok(bootPayload, "o boot (card 1) precisa ter sido flushado sem T3 nenhum");
+  });
+});
+
+test("mudança só de parâmetro da URL (query string) não abre ciclo novo", () => {
+  telemetria.__resetForTest();
+  installFreshBrowserShim("/pagina");
+
+  withFakeFetch(() => {
+    telemetria.init({
+      entitySlug: "teste-a17-query-string",
+      endpoint: "http://localhost/telemetria-teste",
+      sampleRate: 1,
+      batchSize: 1000,
+    });
+
+    // baseline inclui os marcos automáticos do boot (T1/T4), antes de
+    // qualquer mark() manual — o teste confere um DELTA, não um total fixo.
+    const aceitosNoBoot = telemetria.__getStateForTest()?.buffer.accepted ?? 0;
+
+    const routeAntes = telemetria.__getStateForTest()?.config.route;
+    telemetria.mark("evento-antes-da-query");
+
+    // pathname não muda, só a query string mudaria na app real — o shim não
+    // reflete isso em `location.search` porque a lib nem olha pra ele, só
+    // pra `location.pathname` (que continua o mesmo aqui).
+    pushState();
+
+    const routeDepois = telemetria.__getStateForTest()?.config.route;
+    assert.equal(routeAntes, routeDepois, "rota não muda quando o pathname é o mesmo");
+
+    telemetria.mark("evento-depois-da-query");
+    telemetria.flush();
+
+    // Os dois eventos precisam ter ido pro MESMO ciclo (mesmo ponto de
+    // referência), confirmando que não houve troca de ciclo no meio.
+    const state = telemetria.__getStateForTest();
+    assert.equal(
+      state?.buffer.accepted,
+      aceitosNoBoot + 2,
+      "os dois marks ficam no mesmo buffer/ciclo — nenhuma troca de rota no meio",
+    );
   });
 });
 
@@ -390,7 +459,7 @@ test("mark('action-ready') chamado na rota B não contamina a rota A", () => {
 
   withFakeFetch((calls) => {
     telemetria.init({
-      entitySlug: "teste-a09-isolamento",
+      entitySlug: "teste-a17-isolamento",
       endpoint: "http://localhost/telemetria-teste",
       sampleRate: 1,
       batchSize: 1000,
@@ -399,7 +468,7 @@ test("mark('action-ready') chamado na rota B não contamina a rota A", () => {
     telemetria.flush();
 
     setPathname("/rota-b");
-    (g.history as { pushState: () => void }).pushState();
+    pushState();
     shim.fireRaf();
     shim.fireIdle();
     telemetria.mark("action-ready"); // T3 da rota B
@@ -424,7 +493,7 @@ test("teto de eventos por sessão (spec A02) sobrevive à troca de rota — não
 
   withFakeFetch(() => {
     telemetria.init({
-      entitySlug: "teste-a09-teto",
+      entitySlug: "teste-a17-teto",
       endpoint: "http://localhost/telemetria-teste",
       sampleRate: 1,
       batchSize: 1000,
@@ -437,7 +506,7 @@ test("teto de eventos por sessão (spec A02) sobrevive à troca de rota — não
     telemetria.mark("evento-4-deveria-ser-descartado");
 
     setPathname("/rota-b");
-    (g.history as { pushState: () => void }).pushState();
+    pushState();
 
     telemetria.mark("evento-5-tambem-deveria-ser-descartado");
     telemetria.flush();
