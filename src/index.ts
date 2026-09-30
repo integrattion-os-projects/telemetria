@@ -261,20 +261,72 @@ export function init(config: TelemetriaConfig): void {
  * nenhum, e nenhum campo do manual usava esse valor).
  */
 function recordInitialMarks(): void {
-  if (typeof performance !== "undefined" && typeof performance.getEntriesByType === "function") {
-    const fcp = performance
-      .getEntriesByType("paint")
-      .find((entry) => entry.name === "first-contentful-paint");
-    recordMark("T1", fcp ? fcp.startTime : undefined);
+  recordInitialT1();
 
+  if (typeof performance !== "undefined" && typeof performance.getEntriesByType === "function") {
     const [navEntry] = performance.getEntriesByType(
       "navigation",
     ) as PerformanceNavigationTiming[];
     recordMark("T4", navEntry?.loadEventEnd || undefined);
   } else {
-    recordMark("T1");
     recordMark("T4");
   }
+}
+
+/**
+ * INTG-0139 A21 — achado B1 do A20: `init()` só roda depois de `load` +
+ * `requestIdleCallback`, mas isso NÃO garante que o FCP já tenha acontecido —
+ * apps com gate de sessão (ex.: `LoginGate` renderizando `null` até a sessão
+ * resolver) atrasam o primeiro paint de verdade pra depois disso, às vezes
+ * por segundos. A versão antiga lia `getEntriesByType('paint')` uma única vez
+ * e, sem a entrada ainda, gravava `nowMs()` (o instante do `init()`) como se
+ * fosse o FCP — errado sistematicamente nesse padrão, que é o padrão real do
+ * OS (App Router + `LoginGate`) e do Foccus (gate de auth do Firebase).
+ *
+ * Corrigido com `PerformanceObserver({type: 'paint', buffered: true})`: pega
+ * o FCP na hora se ele já aconteceu (entradas em buffer, entregues assim que
+ * o observer é criado) e espera o evento real se ainda não aconteceu — nunca
+ * mais aproxima com o instante do `init()`. `bootRawPath` é capturado antes
+ * de registrar o observer e conferido quando ele dispara: se uma navegação
+ * client-side já tiver acontecido nesse meio-tempo (FCP raro, mas pode
+ * demorar), o T1 do boot não vaza pra rota errada (mesmo padrão de guarda já
+ * usado pelos callbacks de `handleRouteChange`).
+ */
+function recordInitialT1(): void {
+  const bootRawPath = state?.rawPath;
+
+  const existingFcp = getFcpEntry();
+  if (existingFcp) {
+    recordMark("T1", existingFcp.startTime);
+    return;
+  }
+
+  if (typeof PerformanceObserver !== "function") {
+    recordMark("T1"); // sem Performance API nenhuma pra se apoiar — aproxima
+    return;
+  }
+
+  try {
+    const observer = new PerformanceObserver((list) => {
+      const entry = list.getEntries().find((e) => e.name === "first-contentful-paint");
+      if (!entry) return;
+      observer.disconnect();
+      if (!state || state.rawPath !== bootRawPath) return; // navegou antes do FCP chegar
+      recordMark("T1", entry.startTime);
+    });
+    observer.observe({ type: "paint", buffered: true });
+  } catch {
+    recordMark("T1"); // navegador sem suporte a 'paint' via PerformanceObserver
+  }
+}
+
+function getFcpEntry(): PerformanceEntry | undefined {
+  if (typeof performance === "undefined" || typeof performance.getEntriesByType !== "function") {
+    return undefined;
+  }
+  return performance
+    .getEntriesByType("paint")
+    .find((entry) => entry.name === "first-contentful-paint");
 }
 
 /**
@@ -463,6 +515,23 @@ export function mark(name: string): void {
     pendingMarks.push({ name, timestamp: ts });
     return;
   }
+
+  // INTG-0139 A21 — achado B2 do A20: em alguns roteadores (confirmado com
+  // `<BrowserRouter>` do react-router 7 + React 19), o `popstate` é
+  // processado de forma síncrona pelo PRÓPRIO roteador — render, efeitos e
+  // `mark()` da app rodam ANTES do listener de `popstate` da lib (registrado
+  // depois, dentro de `init()`). O resultado: `mark()` gravava no ciclo da
+  // rota ANTERIOR, porque a lib ainda não tinha percebido a troca. Chamar
+  // `handleRouteChange()` aqui, no início de toda `mark()`, resolve isso sem
+  // depender de ordem de listener nenhuma: se a rota já mudou, a lib
+  // sincroniza (fecha o ciclo antigo, abre o novo) ANTES de gravar o marco —
+  // o listener de `popstate` da lib, quando rodar depois, vira um no-op
+  // (mesmo guard de `rawPath` que já existia). Pequena imprecisão residual
+  // aceita: `routeStartTs` nesse caso é o instante em que `mark()` percebeu a
+  // troca, não o instante exato do evento de navegação — mas nunca mais
+  // grava no lote da rota errada.
+  handleRouteChange();
+  if (!state) return; // handleRouteChange() nunca zera state, guarda defensiva
 
   if (!state.sampledIn) return;
   if (name === "action-ready") {

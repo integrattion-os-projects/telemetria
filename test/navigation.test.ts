@@ -17,10 +17,26 @@ if (!("document" in g)) {
     removeEventListener: () => {},
   };
 }
-if (!("PerformanceObserver" in g)) {
+{
+  // INTG-0139 A21: recordInitialT1 usa PerformanceObserver({type:'paint',
+  // buffered:true}) — entrega uma entrada de FCP sintética quando alguém
+  // observa 'paint', simulando o que `buffered: true` faria num browser real.
+  // SEM guard: o Node já expõe um PerformanceObserver nativo (perf_hooks) que
+  // nunca entrega 'paint' de verdade — sobrescrevemos sempre, de propósito
+  // (ver o mesmo comentário em test/index.test.ts).
+  type FakeEntry = { name: string; startTime: number };
+  type FakeList = { getEntries: () => FakeEntry[] };
   class FakePerformanceObserver {
     static supportedEntryTypes: string[] = [];
-    observe(): void {}
+    #callback: (list: FakeList) => void;
+    constructor(cb: (list: FakeList) => void) {
+      this.#callback = cb;
+    }
+    observe(options?: { type?: string }): void {
+      if (options?.type === "paint") {
+        this.#callback({ getEntries: () => [{ name: "first-contentful-paint", startTime: 0 }] });
+      }
+    }
     disconnect(): void {}
     takeRecords(): unknown[] {
       return [];
@@ -556,6 +572,51 @@ test("teto de eventos por sessão (spec A02) sobrevive à troca de rota — não
       state?.buffer.accepted,
       3,
       "o teto de 3 eventos por SESSÃO continua valendo depois da troca de rota — não é recriado por navegação",
+    );
+  });
+});
+
+test("mark() sincroniza a rota sozinho quando o pathname já mudou antes do listener da lib rodar — regressão do achado B2 (A20)", () => {
+  // A20 encontrou: em alguns roteadores (confirmado com <BrowserRouter> do
+  // react-router 7 + React 19), o popstate é processado de forma SÍNCRONA
+  // pelo próprio roteador — o app já re-renderizou e chamou mark() ANTES do
+  // listener de popstate da lib rodar. Resultado: T3 vazava pro lote da rota
+  // ANTERIOR. Este teste simula a race sem precisar de um router de verdade:
+  // muda `location.pathname` diretamente (sem chamar pushState/popstate),
+  // exatamente como ficaria o mundo no instante em que o app já rodou seu
+  // próprio re-render mas o listener da lib ainda não processou nada.
+  telemetria.__resetForTest();
+  installFreshBrowserShim("/tasks");
+
+  withFakeFetch((calls) => {
+    telemetria.init({
+      entitySlug: "teste-a21-b2",
+      endpoint: "http://localhost/telemetria-teste",
+      sampleRate: 1,
+      batchSize: 1000,
+    });
+    telemetria.flush(); // fecha o ciclo do boot (/tasks)
+
+    // O "roteador" já trocou o pathname e re-renderizou — mas nenhum
+    // pushState/popstate da lib foi disparado ainda (a race exata do B2).
+    setPathname("/profile");
+    telemetria.mark("action-ready"); // mark() precisa perceber a troca sozinho
+    telemetria.flush();
+
+    const payloads = payloadsFromCalls(calls);
+    const rotaMe = payloads.find((p) => p.route === "/profile");
+    const rotaTasksComT3 = payloads.find(
+      (p) => p.route === "/tasks" && p.marks.some((m) => m.name === "T3"),
+    );
+
+    assert.ok(rotaMe, "precisa existir um payload com a rota nova (/profile)");
+    assert.ok(
+      rotaMe!.marks.some((m) => m.name === "T3"),
+      "T3 precisa estar no lote da rota NOVA (/me), não vazar pra rota anterior",
+    );
+    assert.ok(
+      !rotaTasksComT3,
+      "T3 não pode vazar pro lote da rota anterior (/tasks) — regressão do achado B2 (A20)",
     );
   });
 });

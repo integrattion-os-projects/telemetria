@@ -22,10 +22,34 @@ if (!("document" in g)) {
     removeEventListener: () => {},
   };
 }
-if (!("PerformanceObserver" in g)) {
+{
+  // INTG-0139 A21: `recordInitialT1` (src/index.ts) passou a usar
+  // `PerformanceObserver({type: 'paint', buffered: true})` em vez de ler
+  // `getEntriesByType('paint')` uma única vez — sem isso, T1 nunca seria
+  // gravado neste ambiente (achado do A20: o observer real só dispara quando
+  // o FCP acontece de verdade; aqui simulamos entregando de forma síncrona,
+  // como `buffered: true` faria se o FCP já tivesse ocorrido).
+  //
+  // SEM guard `if (!("PerformanceObserver" in g))`: o Node (`perf_hooks`) já
+  // expõe um `PerformanceObserver` GLOBAL nativo desde cedo — o guard antigo
+  // pulava o fake achando que já havia um "real", mas o nativo do Node nunca
+  // entrega entradas de `paint` (Node não pinta nada), deixando T1 travado
+  // pra sempre. Sobrescrevemos sempre, de propósito.
+  type FakeEntry = { name: string; startTime: number };
+  type FakeList = { getEntries: () => FakeEntry[] };
   class FakePerformanceObserver {
     static supportedEntryTypes: string[] = [];
-    observe(): void {}
+    #callback: (list: FakeList) => void;
+    constructor(cb: (list: FakeList) => void) {
+      this.#callback = cb;
+    }
+    observe(options?: { type?: string }): void {
+      if (options?.type === "paint") {
+        this.#callback({
+          getEntries: () => [{ name: "first-contentful-paint", startTime: 0 }],
+        });
+      }
+    }
     disconnect(): void {}
     takeRecords(): unknown[] {
       return [];
