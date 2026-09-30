@@ -277,6 +277,7 @@ card). Este é o contrato que a lib envia e que a rota deve aceitar:
 {
   "entitySlug": "integrattion-os",
   "route": "/projetos/[id]/paginas/[id]",
+  "nav": "pushstate",
   "marks": [
     { "name": "T0", "timestamp": 12.4 },
     { "name": "T1", "timestamp": 340.1 },
@@ -303,6 +304,11 @@ card). Este é o contrato que a lib envia e que a rota deve aceitar:
 - Um mesmo `sessionId` pode gerar múltiplos POSTs (um por lote de
   `batchSize`, mais um final no `visibilitychange`) — a rota de ingestão
   não deve assumir "um POST = uma sessão inteira".
+- **`nav`** (desde 0.3.3, INTG-0139 A23): `"boot" | "pushstate" | "replacestate" | "popstate"`
+  — como este ciclo foi aberto. **A rota de ingestão/consolidado deve excluir
+  ciclos `"popstate"` do cálculo de p50/p75/p95 de T1/T3** (continuam contados
+  na frequência, só o tempo não entra na métrica) — ver "Limitações
+  conhecidas" abaixo pro motivo.
 
 ## API
 
@@ -318,18 +324,31 @@ normalizeRoute(pathname: string, options?: NormalizeRouteOptions): string;
 
 ## Limitações conhecidas
 
-**Nenhuma bloqueante conhecida no momento.** Duas limitações registradas em rodadas anteriores foram
-corrigidas:
+**T1/T3 no voltar do navegador (botão voltar/avançar) não são medidos com confiança — limite de
+ordem de despacho de evento do DOM, não bug de código (INTG-0139 A22/A23).** Quando o usuário aperta
+voltar, o roteador da app (React Router, App Router do Next) pode processar o `popstate` e
+re-renderizar a tela de destino de forma SÍNCRONA antes do listener de `popstate` da lib rodar — a
+lib é carregada por import dinâmico, depois do boot do roteador, então não há como "furar a fila" de
+listeners já registrados (`capture: true` não muda a ordem entre dois listeners no mesmo alvo). O
+`routeStartTs` desse ciclo acaba sendo o instante em que a lib PERCEBEU a troca, não o instante real
+do evento — T1/T3 saem sistematicamente subestimados (tendem a ~0ms, perdendo a duração inteira do
+render). **Decisão do Fioda:** em vez de fingir precisão que não existe, todo ciclo carrega
+`nav: "popstate"` (ver "Contrato de payload" acima) quando aberto dessa forma — **a rota de
+ingestão/consolidado deve excluir esses ciclos do cálculo de p50/p75/p95 de T1/T3**, mas continuar
+contando a frequência (e o INP desses ciclos continua válido, não é afetado pelo mesmo problema).
+Carga direta, navegação por clique e navegação programática (`pushState`/`replaceState`) não são
+afetadas — o wrapper da lib roda de forma síncrona nesses casos, sempre antes de qualquer render do
+app. Caminho futuro, não investigado neste card: a Navigation API do Chromium (`navigation.navigate`,
+eventos com timing mais confiável) pode resolver isso de forma nativa quando tiver suporte cross-browser
+suficiente.
+
+**Duas limitações de rodadas anteriores, corrigidas:**
 
 - **R2 (INTG-0139 A18):** T3 vazando pra rota anterior quando o `popstate` era processado de forma
-  síncrona pelo roteador ANTES do listener da lib (confirmado originalmente com
-  `createBrowserRouter`/`RouterProvider` do react-router 7; depois também confirmado no
-  `<BrowserRouter>` clássico do react-router 7 + React 19, achado B2 do A20 — a limitação era mais
-  geral do que o A18 tinha percebido, não específica de um roteador). **Corrigido na A21:** `mark()`
-  passou a sincronizar a rota sozinho (mesma lógica de `handleRouteChange`) antes de gravar qualquer
-  marco, então não depende mais de qual listener roda primeiro. A correção não é específica de
-  roteador — deve cobrir `createBrowserRouter` também, mesmo sem ter sido reconfirmada
-  especificamente contra ele nesta rodada.
+  síncrona pelo roteador ANTES do listener da lib. **Corrigido na A21:** `mark()` passou a
+  sincronizar a rota sozinho (mesma lógica de `handleRouteChange`) antes de gravar qualquer marco —
+  o LOTE agora cai sempre na rota certa (o que não elimina a imprecisão de T1/T3 nesse cenário
+  específico, tratada separadamente acima com `nav: "popstate"`).
 - **B1 (INTG-0139 A20):** T1 do boot gravava o instante do `init()` em vez do FCP real quando o FCP
   ainda não tinha acontecido nesse momento (comum em apps com gate de sessão, tipo `LoginGate`, que
   atrasam o primeiro paint real). **Corrigido na A21:** `recordInitialT1` usa

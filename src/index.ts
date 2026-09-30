@@ -16,13 +16,13 @@ import { EventBuffer, type BufferedEvent } from "./buffer.js";
 import { normalizeRoute, type NormalizeRouteOptions } from "./route.js";
 import { shouldSample } from "./sampling.js";
 import { createSessionId } from "./session.js";
-import { sendBatch, type VitalsSnapshot } from "./transport.js";
+import { sendBatch, type NavOrigin, type VitalsSnapshot } from "./transport.js";
 import { observeVitals } from "./vitals.js";
 
 export { normalizeRoute } from "./route.js";
 export type { NormalizeRouteOptions } from "./route.js";
 export type { BufferedEvent } from "./buffer.js";
-export type { VitalsSnapshot, TelemetriaPayload } from "./transport.js";
+export type { VitalsSnapshot, TelemetriaPayload, NavOrigin } from "./transport.js";
 
 export interface TelemetriaConfig {
   /** Slug da entity no Integrattion OS (bate com SystemNode). */
@@ -75,6 +75,19 @@ interface TelemetriaState {
    * rotular/agregar no consolidado.
    */
   rawPath: string;
+  /**
+   * INTG-0139 A23 — achado do A22: no `popstate` (botão voltar/avançar), o
+   * roteador da app pode re-renderizar de forma SÍNCRONA antes do listener
+   * da lib rodar (ela é carregada por import dinâmico, depois do boot do
+   * roteador — não há como "furar a fila" de listeners já registrados).
+   * `routeStartTs` desse ciclo só reflete o instante em que a lib PERCEBEU
+   * a troca, não o instante real do evento — T1/T3 tendem a ficar
+   * subestimados (perdem a duração do render). Em vez de fingir precisão
+   * que não existe, o ciclo é marcado com `navOrigin: "popstate"` e o
+   * consolidado (A03) exclui esses ciclos do cálculo de p50/p75/p95 de
+   * T1/T3 — o ciclo continua contado (frequência), só o tempo não entra.
+   */
+  navOrigin: NavOrigin;
 }
 
 let state: TelemetriaState | null = null;
@@ -162,6 +175,7 @@ function handleFlush(events: BufferedEvent[]): void {
     marks: events,
     vitals: state.vitals,
     sessionId: state.config.sessionId,
+    nav: state.navOrigin,
   });
 }
 
@@ -220,6 +234,7 @@ export function init(config: TelemetriaConfig): void {
     // relativos ao início da navegação, subtrair 0 preserva o valor.
     routeStartTs: 0,
     rawPath,
+    navOrigin: "boot",
   };
 
   if (!sampledIn) {
@@ -374,8 +389,17 @@ export function beginNavigation(): void {
  * não drenados. O buffer em si NÃO é recriado (só flushado): recriar
  * zeraria `totalAccepted` e o teto de eventos por sessão (spec A02) passaria
  * a valer por rota, não por sessão.
+ *
+ * `origin` (INTG-0139 A23) rotula o ciclo que está sendo aberto — ver
+ * `NavOrigin` em transport.ts. `"popstate"` é usado tanto pelo listener de
+ * `popstate` quanto pelo caminho de `mark()` que sincroniza a rota sozinho
+ * (achado B2 do A20): esse segundo caminho só existe justamente porque um
+ * `popstate` está em andamento e o listener da lib ainda não rodou — não há
+ * outro cenário em que `mark()` precise "alcançar" uma troca de rota que o
+ * próprio wrapper de `pushState`/`replaceState` (síncrono, sempre roda antes
+ * de qualquer render) já não tivesse capturado primeiro.
  */
-function handleRouteChange(): void {
+function handleRouteChange(origin: NavOrigin): void {
   if (!state) return;
 
   const rawPath = typeof location !== "undefined" ? location.pathname : "/";
@@ -402,6 +426,7 @@ function handleRouteChange(): void {
   pendingNavStartTs = null; // consumo único — não vaza pra próxima navegação
 
   state.rawPath = rawPath;
+  state.navOrigin = origin;
   state.config.route = normalizeRoute(rawPath, {
     extraStaticSegments: state.config.extraStaticSegments,
   });
@@ -443,6 +468,7 @@ function installNavigationHooks(): void {
   if (typeof window === "undefined" || typeof history === "undefined") return;
   navHooksInstalled = true;
 
+  const originByMethod = { pushState: "pushstate", replaceState: "replacestate" } as const;
   (["pushState", "replaceState"] as const).forEach((method) => {
     const original = history[method];
     history[method] = function (
@@ -450,12 +476,12 @@ function installNavigationHooks(): void {
       ...args: Parameters<History[typeof method]>
     ): ReturnType<History[typeof method]> {
       const result = original.apply(this, args);
-      handleRouteChange();
+      handleRouteChange(originByMethod[method]);
       return result;
     } as History[typeof method];
   });
 
-  window.addEventListener("popstate", () => handleRouteChange());
+  window.addEventListener("popstate", () => handleRouteChange("popstate"));
 }
 
 /**
@@ -526,11 +552,17 @@ export function mark(name: string): void {
   // depender de ordem de listener nenhuma: se a rota já mudou, a lib
   // sincroniza (fecha o ciclo antigo, abre o novo) ANTES de gravar o marco —
   // o listener de `popstate` da lib, quando rodar depois, vira um no-op
-  // (mesmo guard de `rawPath` que já existia). Pequena imprecisão residual
-  // aceita: `routeStartTs` nesse caso é o instante em que `mark()` percebeu a
-  // troca, não o instante exato do evento de navegação — mas nunca mais
-  // grava no lote da rota errada.
-  handleRouteChange();
+  // (mesmo guard de `rawPath` que já existia).
+  //
+  // INTG-0139 A23 — achado do A22: esse caminho só é alcançado quando um
+  // `popstate` está em andamento e o listener da lib ainda não rodou (ver
+  // nota de `handleRouteChange`) — por isso `origin: "popstate"` aqui, nunca
+  // outro valor. `routeStartTs` desse ciclo é o instante em que `mark()`
+  // percebeu a troca, não o instante exato do evento — T1/T3 tendem a vir
+  // subestimados. Por isso o ciclo é marcado `"popstate"` e o consolidado
+  // (A03) exclui esses ciclos do cálculo de p50/p75/p95 de T1/T3 — nunca mais
+  // finge precisão que não existe.
+  handleRouteChange("popstate");
   if (!state) return; // handleRouteChange() nunca zera state, guarda defensiva
 
   if (!state.sampledIn) return;

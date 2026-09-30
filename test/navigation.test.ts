@@ -620,3 +620,92 @@ test("mark() sincroniza a rota sozinho quando o pathname já mudou antes do list
     );
   });
 });
+
+test("cada ciclo é marcado com a origem correta (nav): boot, pushstate, replacestate, popstate", () => {
+  // INTG-0139 A23 — achado do A22: T1/T3 no popstate são subestimados (a
+  // lib percebe a troca DEPOIS do render síncrono do roteador, sem
+  // possibilidade de corrigir via listener). Em vez de fingir precisão que
+  // não existe, cada ciclo carrega sua origem — o consolidado (A03) exclui
+  // "popstate" do cálculo de p50/p75/p95, mas continua contando o ciclo.
+  telemetria.__resetForTest();
+  const shim = installFreshBrowserShim("/inicio");
+
+  withFakeFetch((calls) => {
+    telemetria.init({
+      entitySlug: "teste-a23-nav-origin",
+      endpoint: "http://localhost/telemetria-teste",
+      sampleRate: 1,
+      batchSize: 1000,
+    });
+    telemetria.flush();
+
+    setPathname("/via-pushstate");
+    pushState();
+    shim.fireRaf();
+    shim.fireIdle();
+    telemetria.flush();
+
+    setPathname("/via-replacestate");
+    (g.history as { replaceState: () => void }).replaceState();
+    shim.fireRaf();
+    shim.fireIdle();
+    telemetria.flush();
+
+    setPathname("/via-popstate");
+    shim.firePopstate();
+    shim.fireRaf();
+    shim.fireIdle();
+    telemetria.flush();
+
+    const payloads = payloadsFromCalls(calls) as Array<{
+      route: string;
+      nav: string;
+      marks: Array<{ name: string }>;
+    }>;
+
+    const boot = payloads.find((p) => p.route === "/inicio");
+    const viaPush = payloads.find((p) => p.route === "/via-pushstate");
+    const viaReplace = payloads.find((p) => p.route === "/via-replacestate");
+    const viaPop = payloads.find((p) => p.route === "/via-popstate");
+
+    assert.equal(boot?.nav, "boot", "ciclo do boot precisa vir marcado nav:'boot'");
+    assert.equal(viaPush?.nav, "pushstate", "ciclo aberto por pushState precisa vir marcado nav:'pushstate'");
+    assert.equal(
+      viaReplace?.nav,
+      "replacestate",
+      "ciclo aberto por replaceState precisa vir marcado nav:'replacestate'",
+    );
+    assert.equal(viaPop?.nav, "popstate", "ciclo aberto por popstate precisa vir marcado nav:'popstate'");
+  });
+});
+
+test("mark() sincronizando a rota sozinho (achado B2) marca o ciclo como nav:'popstate'", () => {
+  // O caminho de mark() que sincroniza a rota (handleRouteChange chamado de
+  // dentro de mark()) só existe pra cobrir a race do popstate — precisa
+  // sempre marcar nav:'popstate', nunca outro valor, mesmo sem o listener
+  // de popstate ter disparado ainda.
+  telemetria.__resetForTest();
+  installFreshBrowserShim("/tasks");
+
+  withFakeFetch((calls) => {
+    telemetria.init({
+      entitySlug: "teste-a23-mark-sync-nav",
+      endpoint: "http://localhost/telemetria-teste",
+      sampleRate: 1,
+      batchSize: 1000,
+    });
+    telemetria.flush();
+
+    setPathname("/perfil-sincronizado");
+    telemetria.mark("action-ready"); // mark() percebe a troca sozinho (sem pushState/popstate disparado)
+    telemetria.flush();
+
+    const payloads = payloadsFromCalls(calls) as Array<{ route: string; nav: string }>;
+    const rotaNova = payloads.find((p) => p.route === "/perfil-sincronizado");
+    assert.equal(
+      rotaNova?.nav,
+      "popstate",
+      "ciclo sincronizado por mark() precisa vir marcado nav:'popstate' (é sempre a mesma race)",
+    );
+  });
+});
