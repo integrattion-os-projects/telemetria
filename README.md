@@ -316,6 +316,19 @@ flush(): void; // força o envio do buffer pendente
 normalizeRoute(pathname: string, options?: NormalizeRouteOptions): string;
 ```
 
+## Limitações conhecidas
+
+**T3 pode vazar pra rota anterior com `createBrowserRouter`/`RouterProvider` do react-router 7
+(INTG-0139 A18, achado R2).** A lib detecta troca de rota escutando `popstate`, mas alguns
+roteadores (confirmado com `createBrowserRouter`) reagem ao `popstate` e chamam o `mark()` da app de
+forma síncrona, ANTES do listener da lib rodar — nesse cenário específico (tipicamente ao voltar do
+navegador), o T3 da tela de destino pode ser gravado ainda com `routeStartTs`/`rawPath` da rota
+anterior. **Não reproduz** com o `<BrowserRouter>` clássico do react-router (usado pelo Foccus) nem
+com o App Router do Next (usado pelo OS) — não é um problema geral da lib, é específico de como
+aquele roteador reage a `popstate`. Antes de plugar a lib num sistema novo, confira qual roteador
+ele usa; se for `createBrowserRouter`/`RouterProvider`, teste o cenário de voltar do navegador com
+dados reais antes de confiar em T1/T3 vindos da telemetria desse sistema.
+
 ## Desenvolvimento
 
 ```bash

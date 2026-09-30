@@ -339,6 +339,46 @@ test("beginNavigation() é consumida uma única vez — não vaza pra navegaçã
   });
 });
 
+test("beginNavigation() sem troca de rota real não contamina a próxima navegação de verdade — regressão do achado R1 (A18)", async () => {
+  // A18 encontrou: clicar num item de menu que aponta pra própria página
+  // atual, com beginNavigation() antes, dispara um pushState/replaceState
+  // que NÃO muda o pathname (early-return de handleRouteChange) — mas a
+  // intenção pendente não era limpa nesse caminho, então sobrevivia e era
+  // consumida pela PRÓXIMA navegação de verdade, minutos depois, inventando
+  // um T0 sem relação nenhuma com ela.
+  telemetria.__resetForTest();
+  const shim = installFreshBrowserShim("/bravo");
+
+  await withFakeFetch(async (calls) => {
+    telemetria.init({
+      entitySlug: "teste-a19-r1",
+      endpoint: "http://localhost/telemetria-teste",
+      sampleRate: 1,
+      batchSize: 1000,
+    });
+    telemetria.flush();
+
+    telemetria.beginNavigation(); // clique num item que aponta pra própria /bravo
+    pushState(); // pathname não muda — early-return de handleRouteChange
+
+    await new Promise((resolve) => setTimeout(resolve, 300)); // usuário lê a tela
+
+    setPathname("/charlie"); // navegação de verdade, SEM beginNavigation() nova
+    pushState();
+    shim.fireRaf();
+    shim.fireIdle();
+    telemetria.flush();
+
+    const rotaCharlie = payloadsFromCalls(calls).find((p) => p.route === "/charlie");
+    assert.ok(rotaCharlie, "precisa existir payload da rota /charlie");
+    const t0 = rotaCharlie!.marks.find((m) => m.name === "T0");
+    assert.ok(
+      !t0,
+      `T0 não deveria existir (a intenção antiga era de uma "navegação" que nem trocou de rota), mas veio ${t0?.timestamp}ms`,
+    );
+  });
+});
+
 test("popstate (botão voltar) dispara um ciclo novo de marcos, sem depender de beginNavigation()", () => {
   telemetria.__resetForTest();
   const shim = installFreshBrowserShim("/inicio");

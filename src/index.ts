@@ -331,7 +331,17 @@ function handleRouteChange(): void {
   // duas telas do mesmo molde (`/card/1` → `/card/2`, ambas `/card/[id]`)
   // agora abrem ciclo novo; mudança só de query string (pathname igual)
   // continua sendo no-op, como sempre foi.
-  if (rawPath === state.rawPath) return;
+  if (rawPath === state.rawPath) {
+    // A19 — achado R1 do A18: mesmo sem trocar de rota, o evento de
+    // pushState/replaceState/popstate ACONTECEU (roteadores disparam isso até
+    // pra "navegar" pra própria URL atual) — se não limpar `pendingNavStartTs`
+    // aqui, uma `beginNavigation()` que não levou a troca de rota nenhuma
+    // ficava pendente e era consumida pela PRÓXIMA navegação de verdade,
+    // inventando um T0 sem relação nenhuma com ela (mesma classe do achado do
+    // A14, agora restrita ao T0 já que o resto do mecanismo mudou).
+    pendingNavStartTs = null;
+    return;
+  }
 
   flushNow();
 
